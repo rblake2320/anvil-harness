@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anvil-harness"
+version = "0.1.0"
+description = "Governed, proof-gated execution harness for long-horizon AI agent work"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Ron Blake" }]
+dependencies = []   # stdlib-only core: runs air-gapped, nothing to vet
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+anvil = "anvil.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["anvil*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
