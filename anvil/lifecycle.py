@@ -153,10 +153,57 @@ class Lifecycle:
         self._set_phase(Phase.REVIEW, note="contract compiled + sealed")
         return StepResult(self.phase, f"compiled {len(contract.tasks)} tasks")
 
+    @staticmethod
+    def _task_path_in_scope(task_path: str, scope_in: list[str]) -> bool:
+        """True if task_path is contained within the contract's scope_in."""
+        prefix = task_path.split("*")[0].rstrip("/")
+        if not prefix:
+            return False  # bare wildcard (*) can escape any bounded scope
+        for s in scope_in:
+            scope_root = s.rstrip("/*")
+            if prefix == scope_root or prefix.startswith(scope_root + "/"):
+                return True
+        return False
+
+    @staticmethod
+    def _find_dag_cycles(tasks: list) -> list[str]:
+        """Kahn's algorithm: return task IDs that are part of a cycle."""
+        id_set = {t.id for t in tasks}
+        successors: dict[str, list[str]] = {t.id: [] for t in tasks}
+        in_degree: dict[str, int] = {t.id: 0 for t in tasks}
+        for t in tasks:
+            for dep in t.deps:
+                if dep in id_set:
+                    successors[dep].append(t.id)
+                    in_degree[t.id] += 1
+        queue = [tid for tid, deg in in_degree.items() if deg == 0]
+        processed = 0
+        while queue:
+            node = queue.pop()
+            processed += 1
+            for succ in successors[node]:
+                in_degree[succ] -= 1
+                if in_degree[succ] == 0:
+                    queue.append(succ)
+        return [tid for tid, deg in in_degree.items() if deg > 0]
+
     def review(self) -> StepResult:
         """Gate the plan itself before any work begins."""
         assert self.contract
         problems: list[str] = []
+
+        # Duplicate task IDs collapse acceptance locks and make state incoherent.
+        seen_ids: set[str] = set()
+        for t in self.contract.tasks:
+            if t.id in seen_ids:
+                problems.append(f"duplicate task id '{t.id}'")
+            seen_ids.add(t.id)
+
+        # DAG cycles would make execute_all spin forever with no ready tasks.
+        cycle_nodes = self._find_dag_cycles(self.contract.tasks)
+        if cycle_nodes:
+            problems.append(f"dependency cycle among tasks: {cycle_nodes}")
+
         for t in self.contract.tasks:
             if not t.acceptance:
                 problems.append(f"{t.id}: no acceptance criteria")
@@ -168,8 +215,14 @@ class Lifecycle:
                         f"require independent (QA) authorship"
                     )
             for dep in t.deps:
-                if dep not in {x.id for x in self.contract.tasks}:
+                if dep not in seen_ids:
                     problems.append(f"{t.id}: unknown dependency '{dep}'")
+            # Task paths must be contained within the contract's declared scope.
+            for p in t.paths:
+                if not self._task_path_in_scope(p, self.contract.scope_in):
+                    problems.append(
+                        f"{t.id}: path '{p}' is outside contract scope {self.contract.scope_in}"
+                    )
         if problems:
             self._log(EventType.REVIEW_REJECTED, problems=problems)
             self._set_phase(Phase.HALTED, note="review rejected")
@@ -287,9 +340,8 @@ class Lifecycle:
             )
 
             # If the adapter explicitly signals failure, strike immediately.
-            # An ok=False return means the work was not done — do not proceed to verify.
+            # _strike() logs TASK_FAILED — don't log it here too.
             if not result.get("ok", True):
-                self._log(EventType.TASK_FAILED, task=task.id, reason="adapter returned ok=False")
                 return self._strike(task, "adapter returned ok=False")
 
             # TOKEN: if the adapter returns usage, charge + log it, then re-check budget.
@@ -308,6 +360,7 @@ class Lifecycle:
                 ok_b, reason_b = self.breaker.check()
                 if not ok_b:
                     self._log(EventType.CIRCUIT_OPEN, reason=reason_b)
+                    task.status = TaskStatus.BLOCKED
                     self._set_phase(Phase.HALTED, note=reason_b or "token budget exceeded")
                     return False
 
@@ -395,11 +448,11 @@ class Lifecycle:
         """Final audit vs ORIGINAL_REQUEST + durable memory write."""
         ok, reason = self.ledger.verify()
         self._log(EventType.MEMORY_WRITTEN, action="audit", ledger_ok=ok, reason=reason)
-        self._maybe_anchor()  # anchor channel digests before closing the ledger
         for line in lessons:
             self.store.append_memory(f"- {line}")
         self.store.append_memory(f"- run complete; request={self.store.request_hash()}")
         self._set_phase(Phase.DONE, note="learned + audited")
+        self._maybe_anchor()  # anchor AFTER all channel writes including DONE phase change
         return StepResult(self.phase, f"done; ledger_ok={ok}")
 
     # ---- audit ----

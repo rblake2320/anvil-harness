@@ -75,3 +75,19 @@ def test_normalized_sibling_path_allowed():
     pe = PolicyEngine()
     d = pe.decide(ToolCall(tool="edit", paths=["src/sub/../sibling.py"]), _task())
     assert d.allowed, "legitimate intra-scope traversal should be allowed"
+
+
+def test_empty_tools_list_denies_all():
+    """task.tools=[] must be fail-closed — no tool call is permitted."""
+    pe = PolicyEngine()
+    t = _task(tools=[])
+    d = pe.decide(ToolCall(tool="edit", paths=["src/a.py"]), t)
+    assert not d.allowed, "empty tool list should deny everything"
+
+
+def test_task_with_no_tools_field_denies_all():
+    """tools=None / empty is fail-closed regardless of how it arrives."""
+    pe = PolicyEngine()
+    t = Task(id="t1", title="x", tools=[], paths=["src/*"], acceptance=[])
+    d = pe.decide(ToolCall(tool="curl"), t)
+    assert not d.allowed

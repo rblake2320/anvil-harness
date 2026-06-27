@@ -135,10 +135,16 @@ class MissionStore:
         Use this to link a resumed Lifecycle to its original trace segment:
             lc = Lifecycle(store, agent, verifier,
                            trace_id=store.recover_trace_id())
-        Returns None if no intake_frozen event exists (run never started intake).
+        Returns None if no intake_frozen event exists or the ledger has been tampered.
+        Verifies ledger integrity before trusting any content.
         """
         if not self.ledger_path.exists():
             return None
+        from .ledger import Ledger
+        led = Ledger(self.ledger_path)
+        ok, _ = led.verify()
+        if not ok:
+            return None  # tampered ledger — do not trust any payload
         with self.ledger_path.open("r", encoding="utf-8") as f:
             for raw in f:
                 line = raw.strip()

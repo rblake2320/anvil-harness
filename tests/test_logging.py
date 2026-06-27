@@ -711,3 +711,100 @@ def test_recover_trace_id_from_store(tmp_path):
 def test_recover_trace_id_returns_none_before_intake(tmp_path):
     """Returns None when no intake_frozen event exists yet."""
     assert MissionStore(tmp_path).recover_trace_id() is None
+
+
+# ---- verify-logs: appended entries after anchor ----------------------------
+
+def test_verify_logs_detects_appended_channel_entries(tmp_path):
+    """Entries appended to a channel file AFTER the anchor must be flagged."""
+    from anvil.cli import main as cli_main
+    from anvil import AcceptanceCheck, Contract, Lifecycle, MissionStore, Task, ToolCall
+
+    tasks = [Task(id="t1", title="x", tools=["edit"], paths=["src/*"],
+                  acceptance=[_qa("c1")])]
+    agent = SimulatedAgent(
+        calls_for=lambda t: [ToolCall(tool="edit", paths=["src/a.py"], task_id=t.id)],
+    )
+    lc = Lifecycle(MissionStore(tmp_path), agent, SimulatedVerifier({"c1": True}))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=tasks))
+    lc.review(); lc.execute_all(); lc.learn([])
+
+    # Append a forged entry to the txn channel AFTER the anchor
+    txn_path = tmp_path / ".mission" / "logs" / "txn.jsonl"
+    assert txn_path.exists()
+    with txn_path.open("a", encoding="utf-8") as f:
+        import json as _json, time as _time
+        forged = {"ts": _time.time(), "channel": "txn", "level": "info",
+                  "event": "task_done", "payload": {"task": "FORGED"}}
+        f.write(_json.dumps(forged) + "\n")
+
+    rc = cli_main(["verify-logs", str(tmp_path)])
+    assert rc == 1, "appended forged entry should cause verify-logs to exit 1"
+
+
+# ---- recover_trace_id: tampered ledger returns None -------------------------
+
+def test_recover_trace_id_tampered_ledger_returns_none(tmp_path):
+    """recover_trace_id must return None if the ledger fails integrity verification."""
+    import json as _json
+
+    lc = Lifecycle(MissionStore(tmp_path),
+                   SimulatedAgent(calls_for=lambda t: []),
+                   SimulatedVerifier({}))
+    lc.intake("request")
+
+    # Corrupt the ledger by mutating the first line
+    ledger_path = tmp_path / ".mission" / "LEDGER.jsonl"
+    lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    rec = _json.loads(lines[0])
+    rec["payload"]["trace_id"] = "tr-FORGED"
+    lines[0] = _json.dumps(rec)
+    ledger_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Must not return the forged trace_id
+    recovered = MissionStore(tmp_path).recover_trace_id()
+    assert recovered is None, "tampered ledger should cause recover_trace_id to return None"
+
+
+# ---- extended redaction: AWS, Slack, JWT ------------------------------------
+
+def test_redact_aws_access_key():
+    from anvil import _redact
+    payload = {"key": "AKIAIOSFODNN7EXAMPLE"}  # 20-char AWS key ID
+    assert _redact(payload)["key"] == "[REDACTED]"
+
+
+def test_redact_slack_bot_token():
+    from anvil import _redact
+    # Build at runtime — literal Slack token strings trigger GitHub push protection.
+    prefix, mid, suffix = "xoxb", "123456789012-1234567890123", "abcdefghijklmnopqrstuvwx"
+    tok = f"{prefix}-{mid}-{suffix}"
+    payload = {"tok": tok}
+    assert _redact(payload)["tok"] == "[REDACTED]"
+
+
+def test_redact_jwt():
+    from anvil import _redact
+    # Build at runtime to avoid triggering secret scanners on the literal.
+    header = "eyJhbGciOiJIUzI1NiJ9"
+    body = "eyJzdWIiOiJ1c2VyIn0"
+    sig = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    jwt = f"{header}.{body}.{sig}"
+    payload = {"auth": jwt}
+    assert _redact(payload)["auth"] == "[REDACTED]"
+
+
+# ---- CommandVerifier: empty cmd rejected ------------------------------------
+
+def test_command_verifier_rejects_empty_cmd():
+    from anvil.adapters import CommandVerifier
+    from anvil import AcceptanceCheck, Task
+
+    task = Task(id="t1", title="x", tools=[], paths=[], acceptance=[])
+    check = AcceptanceCheck(id="c1", description="d", kind="command",
+                            spec={},   # missing cmd
+                            authored_by="qa")
+    ev = CommandVerifier().run_check(task, check)
+    assert not ev.ok
+    assert "cmd" in ev.detail.lower()

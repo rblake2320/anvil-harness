@@ -133,9 +133,12 @@ _REDACT_KEYS: frozenset[str] = frozenset({
 
 _SECRET_RE = re.compile(
     r"(?:"
-    r"sk-[A-Za-z0-9]{20,}"          # OpenAI-style API keys
-    r"|ghp_[A-Za-z0-9]{36}"         # GitHub personal tokens
-    r"|[A-Za-z0-9+/]{48,}={0,2}"    # long base64 blobs (≥48 chars to avoid FP)
+    r"sk-[A-Za-z0-9]{20,}"                            # OpenAI-style API keys
+    r"|ghp_[A-Za-z0-9]{36}"                           # GitHub personal tokens
+    r"|AKIA[0-9A-Z]{16}"                              # AWS access key IDs
+    r"|xox[bpas]-[0-9A-Za-z-]{20,}"                  # Slack bot/user/app tokens
+    r"|eyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+"  # JWTs (3 base64url parts)
+    r"|[A-Za-z0-9+/]{48,}={0,2}"                     # long base64 blobs (>=48 chars)
     r")",
     re.ASCII,
 )

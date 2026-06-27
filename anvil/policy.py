@@ -67,8 +67,8 @@ class PolicyEngine:
         return any(fnmatch.fnmatch(norm, pat) for pat in allowed)
 
     def decide(self, call: ToolCall, task: Task) -> PolicyDecision:
-        # 1. allowlist
-        if task.tools and call.tool not in task.tools:
+        # 1. allowlist — empty tools list means NO tools are permitted (fail-closed).
+        if not task.tools or call.tool not in task.tools:
             return PolicyDecision(False, f"tool '{call.tool}' not in task '{task.id}' allowlist")
 
         # 4a. credential wall: privileged tools need an elevated session

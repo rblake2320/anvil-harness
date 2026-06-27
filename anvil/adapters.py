@@ -45,6 +45,9 @@ class CommandVerifier:
             return Evidence(task.id, check.id, ok=False,
                             detail=f"CommandVerifier cannot handle kind={check.kind}")
         cmd = check.spec.get("cmd")
+        if not cmd:
+            return Evidence(task.id, check.id, ok=False,
+                            detail="CommandVerifier: spec['cmd'] is missing or empty")
         expect_exit = check.spec.get("expect_exit", 0)
         expect_sub = check.spec.get("expect_substring")
         try:

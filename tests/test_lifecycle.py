@@ -221,3 +221,87 @@ def test_token_ceiling_halts_mid_task(tmp_path):
     assert result.halted, "run must halt when token ceiling is exceeded mid-task"
     assert lc.phase == Phase.HALTED
     assert EventType.CIRCUIT_OPEN.value in _types(lc)
+
+
+def test_task_path_outside_contract_scope_rejected(tmp_path):
+    """Review must reject a task whose paths lie outside the contract scope_in."""
+    task = Task(id="t1", title="x", tools=["edit"], paths=["*"],
+                acceptance=[_qa("c1")])
+    lc = Lifecycle(MissionStore(tmp_path),
+                   SimulatedAgent(calls_for=lambda t: []),
+                   SimulatedVerifier({"c1": True}))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=[task]))
+    res = lc.review()
+    assert res.halted, "bare wildcard path outside contract scope should be rejected"
+
+
+def test_duplicate_task_ids_rejected(tmp_path):
+    """Review must reject a contract with duplicate task IDs."""
+    tasks = [
+        Task(id="t1", title="x", tools=["edit"], paths=["src/*"], acceptance=[_qa("c1")]),
+        Task(id="t1", title="y", tools=["edit"], paths=["src/*"], acceptance=[_qa("c2")]),
+    ]
+    lc = Lifecycle(MissionStore(tmp_path),
+                   SimulatedAgent(calls_for=lambda t: []),
+                   SimulatedVerifier({"c1": True, "c2": True}))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=tasks))
+    res = lc.review()
+    assert res.halted, "duplicate task IDs should be rejected at review"
+
+
+def test_dag_cycle_rejected(tmp_path):
+    """Review must reject a contract with a cyclic dependency."""
+    tasks = [
+        Task(id="a", title="a", deps=["b"], tools=["edit"], paths=["src/*"], acceptance=[_qa("c1")]),
+        Task(id="b", title="b", deps=["a"], tools=["edit"], paths=["src/*"], acceptance=[_qa("c2")]),
+    ]
+    lc = Lifecycle(MissionStore(tmp_path),
+                   SimulatedAgent(calls_for=lambda t: []),
+                   SimulatedVerifier({"c1": True, "c2": True}))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=tasks))
+    res = lc.review()
+    assert res.halted, "cyclic dependency should be rejected at review"
+
+
+def test_budget_trip_marks_task_blocked(tmp_path):
+    """After a mid-task token budget trip, the task status must be BLOCKED."""
+    task = Task(id="t1", title="x", tools=["edit"], paths=["src/*"],
+                acceptance=[_qa("c1")])
+    lc = Lifecycle(MissionStore(tmp_path),
+                   SimulatedAgent(
+                       calls_for=lambda t: [ToolCall(tool="edit", paths=["src/a.py"], task_id=t.id)],
+                       perform_fn=lambda t, c: {"ok": True, "input_tokens": 2_000_000},
+                   ),
+                   SimulatedVerifier({"c1": True}),
+                   budget=Budget(max_input_tokens=1_000_000))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=[task]))
+    lc.review(); lc.execute_all()
+
+    assert task.status == TaskStatus.BLOCKED, (
+        f"task status after token budget trip should be BLOCKED, got {task.status}"
+    )
+
+
+def test_perform_no_duplicate_task_failed_events(tmp_path):
+    """ok=False must produce exactly one TASK_FAILED event (not two)."""
+    task = Task(id="t1", title="x", tools=["edit"], paths=["src/*"],
+                acceptance=[_qa("c1")])
+    lc = Lifecycle(MissionStore(tmp_path),
+                   SimulatedAgent(
+                       calls_for=lambda t: [ToolCall(tool="edit", paths=["src/a.py"], task_id=t.id)],
+                       perform_fn=lambda t, c: {"ok": False},
+                   ),
+                   SimulatedVerifier({"c1": True}))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=[task]))
+    lc.review(); lc.execute_all()
+
+    failed_events = [e for e in lc.ledger.entries() if e.type == EventType.TASK_FAILED.value]
+    # 3 strikes each produce one TASK_FAILED = 3 total, none from the explicit log
+    for e in failed_events:
+        assert e.payload.get("strikes") is not None, \
+            "all TASK_FAILED events should come from _strike(), which sets strikes"

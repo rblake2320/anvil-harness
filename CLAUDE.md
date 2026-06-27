@@ -54,8 +54,10 @@ write to the ledger directly from lifecycle code.
 - `channel_digest` events are written by `LogRouter.anchor()` only — not in `EVENT_CHANNELS`.
 - Redaction (`_redact()`) runs before fan-out in `route()` and `write()`. The ledger
   keeps the original. Do not add redaction to ledger paths.
-- `_maybe_anchor()` is idempotent (one channel_digest per run). It fires at HALTED and
-  in `learn()`. Do not call `anchor()` directly from lifecycle code.
+- `_maybe_anchor()` is idempotent (one channel_digest per run). It fires at HALTED (inside
+  `_set_phase`) and at the very end of `learn()`, after `_set_phase(DONE)`, so that the
+  DONE PHASE_CHANGED event is included in the anchor. Do not call `anchor()` directly from
+  lifecycle code, and do not move `_maybe_anchor()` before the final phase change in learn().
 
 **Adding a new EventType**: add the string to `EventType` in `schemas.py`, then add the
 routing entry in `EVENT_CHANNELS` in `log.py`. If it is an error/warning, add its level

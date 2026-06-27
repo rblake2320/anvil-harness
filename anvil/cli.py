@@ -124,11 +124,17 @@ def _verify_logs(root: str) -> int:
             expected_hash = info["hash"]
             expected_count = info["count"]
             actual_hash, actual_count = compute_channel_hash(path, up_to_count=expected_count)
+            # Also count ALL entries to catch forgery appended after the anchor point.
+            _, total_count = compute_channel_hash(path)
             if actual_count < expected_count:
                 print(f"  TRUNCATED  {ch_name}: {actual_count}/{expected_count} entries")
                 any_fail = True
             elif actual_hash != expected_hash:
                 print(f"  TAMPERED   {ch_name}: hash mismatch ({expected_count} entries)")
+                any_fail = True
+            elif total_count > expected_count:
+                extra = total_count - expected_count
+                print(f"  APPENDED   {ch_name}: {extra} unanchored entries after anchor point")
                 any_fail = True
             else:
                 print(f"  ok         {ch_name}: {actual_count} entries")
