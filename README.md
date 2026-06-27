@@ -16,7 +16,7 @@ python -m anvil.cli status /tmp/run      # phase + per-task state
 python -m anvil.cli audit  /tmp/run      # verify the tamper-evident ledger
 python -m anvil.cli ledger /tmp/run      # print the event stream
 python -m anvil.cli verify-logs /tmp/run # check channel digests against ledger anchors
-pytest -q                                # 67 tests prove the safety invariants
+pytest -q                                # 98 tests prove the safety invariants
 ```
 
 ## The lifecycle (cradle to grave)
