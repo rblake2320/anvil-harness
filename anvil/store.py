@@ -129,6 +129,29 @@ class MissionStore:
     def read_memory(self) -> str:
         return self.memory_path.read_text(encoding="utf-8") if self.memory_path.exists() else ""
 
+    def recover_trace_id(self) -> Optional[str]:
+        """Read the ledger and return the trace_id from the first intake_frozen event.
+
+        Use this to link a resumed Lifecycle to its original trace segment:
+            lc = Lifecycle(store, agent, verifier,
+                           trace_id=store.recover_trace_id())
+        Returns None if no intake_frozen event exists (run never started intake).
+        """
+        if not self.ledger_path.exists():
+            return None
+        with self.ledger_path.open("r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") == "intake_frozen":
+                    return rec.get("payload", {}).get("trace_id")
+        return None
+
     # ---- ambiguity / assumption log ----
     def record_assumption(self, question: str, decision: str, reversible: bool) -> None:
         with self.assumptions_path.open("a", encoding="utf-8") as f:

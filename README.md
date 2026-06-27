@@ -35,9 +35,12 @@ pytest -q                                # 67 tests prove the safety invariants
 
 ## The invariants the tests prove (not assert)
 
-1. **Tamper-evidence** — any edit/reorder/truncation of a past ledger entry breaks
-   verification of all later entries (`test_ledger.py`). Optional HMAC/PKA signing
-   stops an attacker who can write the file but lacks the key.
+1. **Tamper-evidence** — any edit, reorder, or insertion into past ledger entries
+   breaks verification of all later entries (`test_ledger.py`). Tail truncation (deleting
+   the last N entries) is not detected by the chain alone; pair with `verify-logs` whose
+   channel-digest anchor in the ledger proves channel state at run close, or use an
+   external head anchor (write the final hash to a separate store). Optional HMAC/PKA
+   signing stops an attacker who can write the file but lacks the key.
 2. **No fake completion** — a task cannot reach `DONE` without an *independent*
    verifier accepting evidence; the executor never grades itself (`test_proofgate.py`).
 3. **No test-gaming** — acceptance criteria are hashed and locked at compile; if the

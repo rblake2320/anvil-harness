@@ -218,10 +218,16 @@ class ChannelWriter:
     applied to JSON-line content instead of structured fields). The tail_hash is
     committed to the audit ledger by LogRouter.anchor(), binding the channel's
     state to the tamper-evident chain.
+
+    max_bytes: if > 0, rotates the active file to <name>.1 when it would exceed
+    this size. Rotation resets the hash chain (the new file starts from genesis).
+    verify-logs correctly reports TRUNCATED for any anchor made before rotation,
+    since actual_count < anchored_count — this is expected and not a tamper signal.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, max_bytes: int = 0) -> None:
         self.path = path
+        self.max_bytes = max_bytes
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.touch()
@@ -236,8 +242,24 @@ class ChannelWriter:
     def entry_count(self) -> int:
         return self._count
 
+    def _maybe_rotate(self, line_bytes: int) -> None:
+        """Rotate active file to .1 if adding line_bytes would exceed max_bytes."""
+        if self.max_bytes <= 0:
+            return
+        try:
+            current = self.path.stat().st_size
+        except FileNotFoundError:
+            return
+        if current + line_bytes > self.max_bytes:
+            backup = self.path.with_suffix(self.path.suffix + ".1")
+            self.path.replace(backup)
+            self.path.touch()
+            self._hash = ZERO_CHANNEL_HASH
+            self._count = 0
+
     def write(self, entry: LogEntry) -> None:
         line = json.dumps(entry.to_dict(), ensure_ascii=False)
+        self._maybe_rotate(len(line.encode("utf-8")) + 1)
         self._hash = _next_hash(self._hash, line)
         self._count += 1
         with self.path.open("a", encoding="utf-8") as f:
@@ -422,3 +444,24 @@ class LogRouter:
                 if count:
                     result[ch.value] = count
         return result
+
+    def token_summary_by_task(self) -> dict[str, dict[str, Any]]:
+        """Aggregate token usage and cost per task_id from the TOKEN channel.
+
+        Returns {task_id: {input_tokens, output_tokens, cost}} for every task
+        that appears in token_charged events. Useful for cost attribution and
+        circuit-breaker post-mortems.
+        """
+        totals: dict[str, dict[str, Any]] = {}
+        for entry in self.read(LogChannel.TOKEN):
+            if entry.event != "token_charged":
+                continue
+            task_id = entry.payload.get("task") or entry.payload.get("task_id")
+            if not task_id:
+                continue
+            if task_id not in totals:
+                totals[task_id] = {"input_tokens": 0, "output_tokens": 0, "cost": 0.0}
+            totals[task_id]["input_tokens"]  += entry.payload.get("input_tokens", 0)
+            totals[task_id]["output_tokens"] += entry.payload.get("output_tokens", 0)
+            totals[task_id]["cost"]          += entry.payload.get("cost", 0.0)
+        return totals

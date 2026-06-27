@@ -54,3 +54,24 @@ def test_no_declared_paths_means_no_filesystem():
     t = _task(paths=[])
     d = pe.decide(ToolCall(tool="edit", paths=["src/app.py"]), t)
     assert not d.allowed
+
+
+def test_path_traversal_blocked():
+    """src/../secret.txt must not bypass the src/* scope guard."""
+    pe = PolicyEngine()
+    d = pe.decide(ToolCall(tool="edit", paths=["src/../secret.txt"]), _task())
+    assert not d.allowed, "traversal path should be denied"
+
+
+def test_double_dot_escape_blocked():
+    """../../etc/passwd must be denied even though task allows src/*."""
+    pe = PolicyEngine()
+    d = pe.decide(ToolCall(tool="edit", paths=["../../etc/passwd"]), _task())
+    assert not d.allowed
+
+
+def test_normalized_sibling_path_allowed():
+    """src/sub/../sibling.py normalizes to src/sibling.py which IS in scope."""
+    pe = PolicyEngine()
+    d = pe.decide(ToolCall(tool="edit", paths=["src/sub/../sibling.py"]), _task())
+    assert d.allowed, "legitimate intra-scope traversal should be allowed"

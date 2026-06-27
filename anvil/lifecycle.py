@@ -286,7 +286,15 @@ class Lifecycle:
                 trace_id=self.trace.trace_id, span_id=span_id,
             )
 
-            # TOKEN: if the adapter returns usage, charge + log it
+            # If the adapter explicitly signals failure, strike immediately.
+            # An ok=False return means the work was not done — do not proceed to verify.
+            if not result.get("ok", True):
+                self._log(EventType.TASK_FAILED, task=task.id, reason="adapter returned ok=False")
+                return self._strike(task, "adapter returned ok=False")
+
+            # TOKEN: if the adapter returns usage, charge + log it, then re-check budget.
+            # Budget is also checked per-step in _guard_budget; this catches a single
+            # tool call that blows past a token ceiling mid-task.
             inp = result.get("input_tokens", 0)
             out = result.get("output_tokens", 0)
             call_cost = result.get("cost", 0.0)
@@ -297,6 +305,11 @@ class Lifecycle:
                           cumulative_cost=self.breaker.cost,
                           cumulative_input_tokens=self.breaker.input_tokens,
                           cumulative_output_tokens=self.breaker.output_tokens)
+                ok_b, reason_b = self.breaker.check()
+                if not ok_b:
+                    self._log(EventType.CIRCUIT_OPEN, reason=reason_b)
+                    self._set_phase(Phase.HALTED, note=reason_b or "token budget exceeded")
+                    return False
 
             # SAGA: if an irreversible side effect succeeded, register compensation NOW
             if self.policy.classify_risk(call) == Risk.IRREVERSIBLE and result.get("ok"):

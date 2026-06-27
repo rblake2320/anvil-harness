@@ -22,6 +22,7 @@ at the PTY layer it governs an adversarial one.
 from __future__ import annotations
 
 import fnmatch
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -57,7 +58,13 @@ class PolicyEngine:
         if not allowed:
             # No declared paths => the task is not permitted to touch the filesystem.
             return False
-        return any(fnmatch.fnmatch(target, pat) for pat in allowed)
+        # Normalize to collapse .. traversals before matching.
+        # os.path.normpath("src/../secret.txt") -> "secret.txt" which won't match "src/*".
+        # Paths that still start with ".." after normalization have escaped the tree root.
+        norm = os.path.normpath(target).replace("\\", "/")
+        if norm.startswith(".."):
+            return False
+        return any(fnmatch.fnmatch(norm, pat) for pat in allowed)
 
     def decide(self, call: ToolCall, task: Task) -> PolicyDecision:
         # 1. allowlist

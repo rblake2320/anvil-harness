@@ -10,7 +10,7 @@ Each test maps to a real-world pain point the council raised:
   * audit                 -> the ledger verifies end-to-end (tamper-evident)
 """
 from anvil import (
-    AcceptanceCheck, Contract, EventType, Lifecycle, MissionStore, Phase,
+    AcceptanceCheck, Budget, Contract, EventType, Lifecycle, MissionStore, Phase,
     PolicyEngine, Risk, SimulatedAgent, SimulatedVerifier, Task, TaskStatus, ToolCall,
     ToolPolicy,
 )
@@ -180,3 +180,44 @@ def test_credential_wall_blocks_prod_tool(tmp_path):
     res = lc.execute_all()
     assert res.halted
     assert EventType.TOOL_CALL_DENIED.value in _types(lc)
+
+
+def test_perform_failure_triggers_strike(tmp_path):
+    """adapter returning ok=False must count as a strike, not silently pass through."""
+    task = Task(id="t1", title="x", tools=["edit"], paths=["src/*"],
+                acceptance=[_qa("c1")])
+    failing_agent = SimulatedAgent(
+        calls_for=lambda t: [ToolCall(tool="edit", paths=["src/a.py"], task_id=t.id)],
+        perform_fn=lambda t, c: {"ok": False, "error": "tool exploded"},
+    )
+    lc = Lifecycle(MissionStore(tmp_path), failing_agent, SimulatedVerifier({"c1": True}))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=[task]))
+    lc.review(); lc.execute_all()
+
+    # task must NOT be DONE; it should be BLOCKED or FAILED after 3 strikes
+    assert task.status != TaskStatus.DONE
+    assert task.strikes > 0
+    assert EventType.TASK_FAILED.value in _types(lc)
+
+
+def test_token_ceiling_halts_mid_task(tmp_path):
+    """A single tool call exceeding max_input_tokens must trip the circuit breaker."""
+    task = Task(id="t1", title="x", tools=["edit"], paths=["src/*"],
+                acceptance=[_qa("c1")])
+    expensive_agent = SimulatedAgent(
+        calls_for=lambda t: [ToolCall(tool="edit", paths=["src/a.py"], task_id=t.id)],
+        # returns 2M input tokens — well over the 1M ceiling
+        perform_fn=lambda t, c: {"ok": True, "input_tokens": 2_000_000},
+    )
+    tight_budget = Budget(max_input_tokens=1_000_000)
+    lc = Lifecycle(MissionStore(tmp_path), expensive_agent,
+                   SimulatedVerifier({"c1": True}), budget=tight_budget)
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=[task]))
+    lc.review()
+    result = lc.execute_all()
+
+    assert result.halted, "run must halt when token ceiling is exceeded mid-task"
+    assert lc.phase == Phase.HALTED
+    assert EventType.CIRCUIT_OPEN.value in _types(lc)

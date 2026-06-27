@@ -73,11 +73,12 @@ class ClaudeCodeAgent:
         return _parse_tool_calls(resp, task.id)
 
     def perform(self, task: Task, call: ToolCall) -> dict:
+        import dataclasses, json
         resp = self.client.messages.create(
             model=self.model,
             max_tokens=8192,
             system="Execute the following tool call exactly.",
-            messages=[{"role": "user", "content": call.model_dump_json()}],
+            messages=[{"role": "user", "content": json.dumps(dataclasses.asdict(call))}],
         )
         return {
             "ok": True,
@@ -108,15 +109,22 @@ writes a single line. Rules of thumb:
 The built-in `CommandVerifier` runs a shell command and returns `Evidence`:
 
 ```python
-from anvil import CommandVerifier
+from anvil import CommandVerifier, AcceptanceCheck
 
-verifier = CommandVerifier(
-    command_for=lambda task, check: f"pytest tests/ -k {check.id} -q"
+# CommandVerifier reads check.spec["cmd"] for the shell command to run.
+verifier = CommandVerifier(cwd="/path/to/repo", timeout=60)
+
+# When compiling tasks, put the command in spec["cmd"]:
+check = AcceptanceCheck(
+    id="c1", description="tests pass", kind="command",
+    spec={"cmd": "pytest tests/ -q", "expect_exit": 0},
+    authored_by="qa",
 )
 ```
 
-`check.spec["command"]` can also carry the command directly if you put it there at
-compile time. Return code 0 → passed; nonzero → failed with stderr as reason.
+Return code matches `spec["expect_exit"]` (default 0) → passed.
+Optional `spec["expect_substring"]` checks stdout+stderr for a string.
+A non-zero exit or missing substring → failed with combined output as detail.
 
 ## approval_fn
 
@@ -152,6 +160,18 @@ ok, reason = Ledger(MissionStore(root).ledger_path, signing_key=key).verify()
 
 Auditing without the key on a signed ledger will report TAMPERED. Use the CLI
 `anvil audit` only for unsigned (dev) runs.
+
+## Token cost rollup per task
+
+```python
+summary = lc.log_router.token_summary_by_task()
+# {"t1": {"input_tokens": 1200, "output_tokens": 400, "cost": 0.018}, ...}
+for task_id, usage in summary.items():
+    print(f"{task_id}: ${usage['cost']:.4f}  in={usage['input_tokens']} out={usage['output_tokens']}")
+```
+
+Reads the TOKEN channel and aggregates `token_charged` events by `task_id`. Useful
+for cost attribution after a multi-task run and for feeding back into budget tuning.
 
 ## verify-logs
 
@@ -215,7 +235,9 @@ class SwappingAgent:
 from anvil import Lifecycle, MissionStore
 
 store = MissionStore(root)
-prior_trace_id = "tr-abc123"    # recovered from the intake_frozen ledger event
+# recover_trace_id() reads the ledger and returns the trace_id from the first
+# intake_frozen event — no manual ledger parsing needed.
+prior_trace_id = store.recover_trace_id()   # None if run never reached intake
 
 lc = Lifecycle(store, agent, verifier, trace_id=prior_trace_id)
 state = store.load_state()

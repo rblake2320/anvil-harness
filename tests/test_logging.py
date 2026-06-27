@@ -563,3 +563,151 @@ def test_token_only_charged_on_actual_perform(tmp_path):
     assert call_count[0] == 1                       # one perform() call
     assert lc.breaker.input_tokens == 500           # exactly one charge
     assert lc.breaker.output_tokens == 100
+
+
+# ---- redaction adversarial coverage -----------------------------------------
+
+def test_redact_deeply_nested_secret():
+    from anvil import _redact
+    payload = {"outer": {"middle": {"password": "s3cr3t", "safe": "visible"}}}
+    clean = _redact(payload)
+    assert clean["outer"]["middle"]["password"] == "[REDACTED]"
+    assert clean["outer"]["middle"]["safe"] == "visible"
+
+
+def test_redact_list_containing_secret_dict():
+    from anvil import _redact
+    payload = {"calls": [{"api_key": "abc123"}, {"tool": "edit"}]}
+    clean = _redact(payload)
+    assert clean["calls"][0]["api_key"] == "[REDACTED]"
+    assert clean["calls"][1]["tool"] == "edit"
+
+
+def test_redact_secret_key_with_int_value_does_not_crash():
+    from anvil import _redact
+    # Sensitive key name but integer value — must not crash, must redact the key
+    payload = {"token": 12345, "count": 1}
+    clean = _redact(payload)
+    assert clean["token"] == "[REDACTED]"
+    assert clean["count"] == 1
+
+
+def test_redact_base64_blob_in_value():
+    from anvil import _redact
+    # 48-char base64 blob — matches _SECRET_RE
+    blob = "dGhpcyBpcyBhIHZlcnkgbG9uZyBiYXNlNjQgc2VjcmV0"   # 46 chars, padded
+    long_blob = "dGhpcyBpcyBhIHZlcnkgbG9uZyBiYXNlNjQgc2VjcmV0dGhpcw=="   # >48
+    payload = {"data": long_blob}
+    assert _redact(payload)["data"] == "[REDACTED]"
+
+
+def test_redact_bearer_token_in_string_value():
+    from anvil import _redact
+    # Secret pattern embedded in a longer string
+    payload = {"cmd": "curl -H 'Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz01'"}
+    clean = _redact(payload)
+    assert clean["cmd"] == "[REDACTED]"
+
+
+def test_redact_non_string_key_does_not_crash():
+    from anvil import _redact
+    # dict keys that are not strings — should not crash
+    payload = {1: "val", "safe": "ok"}
+    clean = _redact(payload)
+    assert clean[1] == "val"
+    assert clean["safe"] == "ok"
+
+
+def test_redact_empty_structures():
+    from anvil import _redact
+    assert _redact({}) == {}
+    assert _redact([]) == []
+    assert _redact("") == ""
+
+
+def test_redact_short_base64_not_redacted():
+    from anvil import _redact
+    # Short base64 (under 48 chars) must NOT be redacted — avoid false positives
+    short = "aGVsbG8="   # "hello" in base64, 8 chars
+    assert _redact({"val": short})["val"] == short
+
+
+# ---- log rotation -----------------------------------------------------------
+
+def test_channel_writer_rotates_at_max_bytes(tmp_path):
+    from anvil.log import ChannelWriter, LogEntry
+    import time
+
+    path = tmp_path / "test.jsonl"
+    writer = ChannelWriter(path, max_bytes=200)   # tiny limit to force rotation
+
+    entry = lambda i: LogEntry(
+        ts=time.time(), channel="test", level="info",
+        event="evt", payload={"i": i}
+    )
+
+    # Write until rotation fires (each line ~80 bytes, 3 writes > 200)
+    for i in range(5):
+        writer.write(entry(i))
+
+    backup = path.with_suffix(".jsonl.1")
+    assert backup.exists(), "rotation must create a .1 backup"
+    # Active file must be smaller than the limit
+    assert path.stat().st_size <= 200
+
+
+def test_channel_writer_no_rotation_when_unlimited(tmp_path):
+    from anvil.log import ChannelWriter, LogEntry
+    import time
+
+    path = tmp_path / "test.jsonl"
+    writer = ChannelWriter(path)   # max_bytes=0 means no limit
+
+    for i in range(20):
+        writer.write(LogEntry(ts=time.time(), channel="c", level="info",
+                              event="e", payload={"i": i}))
+
+    assert not path.with_suffix(".jsonl.1").exists()
+    assert writer.entry_count == 20
+
+
+# ---- token cost rollup per task --------------------------------------------
+
+def test_token_summary_by_task(tmp_path):
+    """token_summary_by_task() aggregates input/output/cost per task_id."""
+    tasks = [
+        Task(id="t1", title="x", tools=["edit"], paths=["src/*"], acceptance=[_qa("c1")]),
+        Task(id="t2", title="y", tools=["edit"], paths=["src/*"], acceptance=[_qa("c2")]),
+    ]
+    agent = SimulatedAgent(
+        calls_for=lambda t: [ToolCall(tool="edit", paths=["src/a.py"], task_id=t.id)],
+        perform_fn=lambda t, c: {"ok": True, "input_tokens": 100, "output_tokens": 50, "cost": 0.001},
+    )
+    lc = Lifecycle(MissionStore(tmp_path), agent, SimulatedVerifier({"c1": True, "c2": True}))
+    lc.intake("x"); lc.baseline({"ref": "b"})
+    lc.compile(Contract(mission="m", scope_in=["src"], scope_out=[], tasks=tasks))
+    lc.review(); lc.execute_all()
+
+    summary = lc.log_router.token_summary_by_task()
+    assert "t1" in summary and "t2" in summary
+    assert summary["t1"]["input_tokens"] == 100
+    assert summary["t1"]["output_tokens"] == 50
+    assert abs(summary["t1"]["cost"] - 0.001) < 1e-9
+
+
+# ---- trace resumption from disk ---------------------------------------------
+
+def test_recover_trace_id_from_store(tmp_path):
+    """MissionStore.recover_trace_id() reads the ledger to find the original trace_id."""
+    lc = Lifecycle(MissionStore(tmp_path),
+                   SimulatedAgent(calls_for=lambda t: []),
+                   SimulatedVerifier({}))
+    lc.intake("a request")
+
+    recovered = MissionStore(tmp_path).recover_trace_id()
+    assert recovered == lc.trace.trace_id
+
+
+def test_recover_trace_id_returns_none_before_intake(tmp_path):
+    """Returns None when no intake_frozen event exists yet."""
+    assert MissionStore(tmp_path).recover_trace_id() is None
