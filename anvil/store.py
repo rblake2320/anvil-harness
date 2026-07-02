@@ -33,8 +33,9 @@ class Contract:
     scope_in: list[str]
     scope_out: list[str]
     tasks: list[Task]
-    acceptance_locks: dict[str, str] = field(default_factory=dict)  # task_id -> locked hash
+    acceptance_locks: dict[str, str] = field(default_factory=dict)   # task_id -> locked hash
     context_budget: dict[str, Any] = field(default_factory=dict)
+    context_spec_locks: dict[str, str] = field(default_factory=dict) # task_id -> context spec hash
 
 
 class MissionStore:
@@ -93,6 +94,7 @@ class MissionStore:
             "scope_out": c.scope_out,
             "context_budget": c.context_budget,
             "acceptance_locks": c.acceptance_locks,
+            "context_spec_locks": c.context_spec_locks,
             "tasks": [t.to_dict() for t in c.tasks],
         }
         self.plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
@@ -106,6 +108,7 @@ class MissionStore:
             tasks=[Task.from_dict(t) for t in plan.get("tasks", [])],
             acceptance_locks=plan.get("acceptance_locks", {}),
             context_budget=plan.get("context_budget", {}),
+            context_spec_locks=plan.get("context_spec_locks", {}),
         )
 
     # ---- state (machine-owned, not the model's memory) ----

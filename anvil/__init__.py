@@ -5,6 +5,7 @@ from .schemas import (
 )
 from .ledger import Ledger, LedgerEntry
 from .budget import Budget, CircuitBreaker
+from .context import ContextSpec, ContextBundle, ContextCompiler, summarize_evidence, DEFAULT_MAX_TOKENS
 from .policy import PolicyEngine, ToolPolicy
 from .proofgate import ProofGate, acceptance_hash
 from .recovery import RecoveryManager, Compensation, Checkpoint, RepairAction
@@ -19,11 +20,12 @@ from .log import (
     _redact,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "AcceptanceCheck", "AmbiguityClass", "EventType", "Phase", "PolicyDecision",
     "Risk", "Task", "TaskStatus", "ToolCall", "Evidence",
     "Ledger", "LedgerEntry", "Budget", "CircuitBreaker", "PolicyEngine", "ToolPolicy",
+    "ContextSpec", "ContextBundle", "ContextCompiler", "summarize_evidence", "DEFAULT_MAX_TOKENS",
     "ProofGate", "acceptance_hash", "RecoveryManager", "Compensation", "Checkpoint",
     "RepairAction", "MissionStore", "Contract", "Lifecycle", "StepResult",
     "AgentAdapter", "VerifierAdapter", "CommandVerifier", "SimulatedAgent", "SimulatedVerifier",

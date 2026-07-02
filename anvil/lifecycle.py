@@ -32,6 +32,7 @@ from typing import Callable, Optional
 
 from .adapters import AgentAdapter, VerifierAdapter
 from .budget import Budget, CircuitBreaker
+from .context import ContextCompiler, summarize_evidence, DEFAULT_MAX_TOKENS
 from .ledger import Ledger, LedgerEntry
 from .log import EVENT_LEVELS, LogChannel, LogLevel, LogRouter, TraceContext
 from .policy import PolicyEngine, ToolPolicy
@@ -83,6 +84,43 @@ class Lifecycle:
         self.phase = Phase.INTAKE
         self.contract: Optional[Contract] = None
         self._anchored = False
+        self._context_compiler = ContextCompiler()
+        # Per-task evidence summaries (proof travels; narrative does not).
+        # Populated in-memory as tasks complete; rebuilt from the ledger on resume.
+        self._evidence_summaries: dict[str, str] = {}
+        self._load_evidence_from_ledger()
+
+    # ---- evidence rebuild (resume durability) ----
+
+    def _load_evidence_from_ledger(self) -> None:
+        """Rebuild evidence summaries from the hash-chained ledger.
+
+        Called at __init__ so a resumed Lifecycle recovers upstream evidence for
+        all PROOF_ACCEPTED tasks without re-running them.
+
+        Invariant: TASK_STARTED resets the in-progress accumulator so a failed
+        attempt's evidence is discarded before the retry begins. Only evidence
+        from a PROOF_ACCEPTED path is committed to _evidence_summaries.
+        """
+        if not self.store.ledger_path.exists():
+            return
+        ok, _ = self.ledger.verify()
+        if not ok:
+            return  # tampered ledger — trust nothing
+        in_progress: dict[str, list] = {}
+        for entry in self.ledger:
+            if entry.type == "task_started":
+                task_id = entry.payload.get("task")
+                if task_id:
+                    in_progress[task_id] = []  # reset: discard any prior attempt's evidence
+            elif entry.type == "evidence_recorded":
+                task_id = entry.payload.get("task")
+                if task_id is not None:
+                    in_progress.setdefault(task_id, []).append(entry)
+            elif entry.type == "proof_accepted":
+                task_id = entry.payload.get("task")
+                if task_id and task_id in in_progress:
+                    self._evidence_summaries[task_id] = summarize_evidence(in_progress[task_id])
 
     # ---- ledger + log router ----
 
@@ -142,14 +180,20 @@ class Lifecycle:
         return StepResult(self.phase, "baseline captured")
 
     def compile(self, contract: Contract) -> StepResult:
-        # LOCK acceptance hashes (the seal that defeats test-gaming)
+        # LOCK acceptance hashes (defeats test-gaming) and context spec hashes
+        # (defeats task-mutation between compile and execute).
+        max_tokens = contract.context_budget.get("max_tokens_per_task", DEFAULT_MAX_TOKENS)
         for t in contract.tasks:
             contract.acceptance_locks[t.id] = self.gate.lock(t)
+            contract.context_spec_locks[t.id] = (
+                self._context_compiler.build_spec(t, max_tokens).spec_hash
+            )
         self.contract = contract
         self.store.save_contract(contract)
         self._log(EventType.CONTRACT_COMPILED,
                   tasks=[t.id for t in contract.tasks],
-                  locks=contract.acceptance_locks)
+                  locks=contract.acceptance_locks,
+                  context_spec_locks=contract.context_spec_locks)
         self._set_phase(Phase.REVIEW, note="contract compiled + sealed")
         return StepResult(self.phase, f"compiled {len(contract.tasks)} tasks")
 
@@ -292,8 +336,40 @@ class Lifecycle:
     def _do_task(self, task: Task, span_id: str) -> bool:
         """Execute -> verify -> (approve+release if irreversible). Returns success."""
 
+        # 0) CONTEXT GATE: verify spec hash, build minimal bundle, pre-flight size check.
+        #    Bundle hash committed to the ledger BEFORE the agent sees any content —
+        #    attested provenance linking every subsequent action to its exact context.
+        max_tokens = self.contract.context_budget.get("max_tokens_per_task", DEFAULT_MAX_TOKENS)
+        locked_hash = self.contract.context_spec_locks.get(task.id, "")
+        bundle = None
+        if locked_hash:
+            live_spec = self._context_compiler.build_spec(task, max_tokens)
+            if live_spec.spec_hash != locked_hash:
+                self._log(EventType.CONTEXT_TAMPERED, task=task.id,
+                          locked=locked_hash, live=live_spec.spec_hash)
+                return self._strike(task, "context spec tampered", deterministic=True)
+            bundle = self._context_compiler.build_bundle(
+                live_spec, self.contract, self._evidence_summaries,
+                tokenizer=getattr(self.agent, "count_tokens", None),
+            )
+            if bundle.estimated_tokens > max_tokens:
+                self._log(EventType.CONTEXT_OVERSIZE, task=task.id,
+                          estimated=bundle.estimated_tokens, limit=max_tokens)
+                return self._strike(
+                    task,
+                    f"context oversize ({bundle.estimated_tokens}>{max_tokens})",
+                    deterministic=True,
+                )
+            self._log(EventType.CONTEXT_COMMITTED, task=task.id,
+                      bundle_hash=bundle.bundle_hash,
+                      estimated_tokens=bundle.estimated_tokens,
+                      estimator=bundle.estimator)
+
         # 1) AGENT DECISION: log what the executor proposes before gating
-        calls = self.agent.plan_calls(task)
+        if bundle is not None and hasattr(self.agent, "plan_calls_with_context"):
+            calls = self.agent.plan_calls_with_context(task, bundle)
+        else:
+            calls = self.agent.plan_calls(task)
         if calls:
             self.log_router.write(
                 LogChannel.AGENT, "agent_decision",
@@ -379,10 +455,12 @@ class Lifecycle:
         task.status = TaskStatus.AWAITING_PROOF
         locked = self.contract.acceptance_locks.get(task.id, "")
         gate = self.gate.evaluate(task, locked, self.verifier)
+        evidence_entries = []
         for ev in gate.evidence:
             entry = self._log(EventType.EVIDENCE_RECORDED, task=task.id, check=ev.check_id,
                               ok=ev.ok, detail=ev.detail)
             task.evidence.append(entry.hash)
+            evidence_entries.append(entry)
         if not gate.ok:
             etype = (EventType.ACCEPTANCE_TAMPERED if "tamper" in gate.reason
                      else EventType.PROOF_REJECTED)
@@ -392,15 +470,23 @@ class Lifecycle:
         self._log(EventType.PROOF_ACCEPTED, task=task.id)
         task.status = TaskStatus.DONE
         self._log(EventType.TASK_DONE, task=task.id, evidence=task.evidence)
+        # Compact evidence for downstream tasks (proof travels; raw transcripts do not)
+        self._evidence_summaries[task.id] = summarize_evidence(evidence_entries)
         self.store.save_state(self.phase, self.contract.tasks)
         return True
 
-    def _strike(self, task: Task, reason: str) -> bool:
-        """Apply the repair ladder. Returns False (task did not complete this pass)."""
+    def _strike(self, task: Task, reason: str, *, deterministic: bool = False) -> bool:
+        """Apply the repair ladder. Returns False (task did not complete this pass).
+
+        deterministic=True: the same spec and store will produce the identical failure
+        (context tamper, oversize). Retrying is pure waste — skip the ladder and
+        escalate to operator immediately on strike 1.
+        """
         task.strikes += 1
-        action = self.recovery.next_action(task.strikes)
+        action = (RepairAction.ESCALATE if deterministic
+                  else self.recovery.next_action(task.strikes))
         self._log(EventType.TASK_FAILED, task=task.id, strikes=task.strikes,
-                  reason=reason, next_action=action.value)
+                  reason=reason, next_action=action.value, deterministic=deterministic)
         if self.recovery.exhausted(task.strikes) or action == RepairAction.ESCALATE:
             task.status = TaskStatus.BLOCKED
             # roll back code state + compensate any external effects from this task

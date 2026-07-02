@@ -79,6 +79,9 @@ class EventType(str, enum.Enum):
     MEMORY_WRITTEN = "memory_written"
     PHASE_CHANGED = "phase_changed"
     TOKEN_CHARGED = "token_charged"
+    CONTEXT_COMMITTED = "context_committed"  # bundle hash anchored before agent call
+    CONTEXT_TAMPERED  = "context_tampered"   # spec hash mismatch — security event
+    CONTEXT_OVERSIZE  = "context_oversize"   # bundle exceeds per-task token ceiling
 
 
 @dataclass

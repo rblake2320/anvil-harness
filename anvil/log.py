@@ -106,6 +106,9 @@ EVENT_CHANNELS: dict[str, list[LogChannel]] = {
     "token_charged":       [_C.TOKEN, _C.TXN],
     "assumption_recorded": [_C.AGENT],
     "memory_written":      [_C.AGENT, _C.CHANGE],
+    "context_committed":   [_C.TRACE, _C.CHANGE],
+    "context_tampered":    [_C.SECURITY, _C.ERROR],
+    "context_oversize":    [_C.ERROR, _C.PERF],
 }
 
 EVENT_LEVELS: dict[str, str] = {
@@ -118,6 +121,8 @@ EVENT_LEVELS: dict[str, str] = {
     "scope_violation":     LogLevel.WARN.value,
     "tool_call_denied":    LogLevel.WARN.value,
     "approval_denied":     LogLevel.WARN.value,
+    "context_tampered":    LogLevel.CRITICAL.value,
+    "context_oversize":    LogLevel.WARN.value,
 }
 
 
