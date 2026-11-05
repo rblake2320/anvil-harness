@@ -142,6 +142,21 @@ lc = Lifecycle(store, agent, verifier, approval_fn=slack_approval)
 ```
 
 The grant (or denial) is recorded in the hash-chained ledger as a non-repudiable event.
+Only a literal `True` grants. Any other return value (`"yes"`, `1`, `None`) or an
+exception (Slack timeout, etc.) is recorded as `APPROVAL_DENIED` with the reason:
+fail safe.
+
+## Fault barriers and isolation
+
+- Adapters receive **deep copies** of the Task. Mutating your copy (adding tools or
+  paths, dropping acceptance checks) does nothing to the harness's grant, and the
+  harness treats it as a tamper attempt (`CONTEXT_TAMPERED` / `ACCEPTANCE_TAMPERED`,
+  immediate escalation).
+- An exception from `plan_calls`, `perform`, `run_check` or `approval_fn` is a strike
+  (or a failed check or denial), never a crashed controller.
+- Pass `rollback_fn=lambda cp: subprocess.run(["git", "reset", "--hard", cp.ref], check=True)`
+  to `Lifecycle` to actually restore code state on escalation. Without it the ledger
+  records `ROLLED_BACK` with `executed=False`.
 
 ## Signed ledger (HMAC)
 
@@ -158,8 +173,28 @@ from anvil import Ledger, MissionStore
 ok, reason = Ledger(MissionStore(root).ledger_path, signing_key=key).verify()
 ```
 
-Auditing without the key on a signed ledger will report TAMPERED. Use the CLI
-`anvil audit` only for unsigned (dev) runs.
+Auditing without the key on a signed ledger will report TAMPERED. The CLI takes the
+key from an environment variable (hex), so it never lands in shell history:
+
+```powershell
+$env:ANVIL_KEY = "<64 hex chars>"            # e.g. pulled from your secrets manager
+anvil audit       C:\runs\m1 --key-env ANVIL_KEY
+anvil verify-logs C:\runs\m1 --key-env ANVIL_KEY
+```
+
+Linux: `export ANVIL_KEY=...` instead of `$env:ANVIL_KEY = ...`.
+
+### Tail-truncation check
+
+The chain cannot detect deletion of its last N entries. At run close, copy
+`lc.ledger.last().hash` somewhere the agent cannot write (ticket, WORM bucket, signed
+email), then later:
+
+```
+anvil audit C:\runs\m1 --expect-head <that hash>
+```
+
+Exit 1 if that entry is no longer in the chain.
 
 ## Token cost rollup per task
 
@@ -235,18 +270,20 @@ class SwappingAgent:
 from anvil import Lifecycle, MissionStore
 
 store = MissionStore(root)
-# recover_trace_id() reads the ledger and returns the trace_id from the first
-# intake_frozen event — no manual ledger parsing needed.
-prior_trace_id = store.recover_trace_id()   # None if run never reached intake
+prior_trace_id = store.recover_trace_id(signing_key=key)   # key=None for unsigned runs
 
-lc = Lifecycle(store, agent, verifier, trace_id=prior_trace_id)
-state = store.load_state()
-contract = store.load_contract()
-lc.contract = contract
-lc.phase = Phase[state["phase"]]
-# Continue from the last known phase
+lc = Lifecycle(store, agent, verifier, signing_key=key, trace_id=prior_trace_id)
+lc.resume()        # verifies ledger + plan seals; DONE tasks stay done
 lc.execute_all()
+lc.learn(["resumed after process death"])
 ```
+
+`resume()` treats the ledger as the trust anchor. It refuses to continue if the ledger
+fails verification, if the on-disk `PLAN.graph.json` no longer reproduces the seals
+committed in the ledger (an edited plan cannot widen a grant), if the plan never
+passed review, or if the mission is already DONE. Task completion comes from
+`TASK_DONE` ledger events; unfinished tasks restart with zero strikes. Saga
+compensations hold live callables and are not restored.
 
 Passing `trace_id=` links the resumed segment's spans to the original trace in any
 aggregator that understands OpenTelemetry-style parent-child correlation.

@@ -33,23 +33,28 @@ def _estimate_tokens(
 ) -> tuple[int, str]:
     """Estimate token count. Returns (count, estimator_label).
 
-    If tokenizer is supplied and returns a positive integer, uses it (label "adapter").
-    On any failure — exception, wrong type, zero, or negative — falls back to heuristic.
+    The heuristic is always computed. If a tokenizer is supplied and returns a
+    positive int, the gate uses max(adapter, heuristic): the adapter may TIGHTEN
+    the gate (exact counts above the heuristic), never loosen it. The tokenizer
+    is agent-supplied, and an agent must not be able to wave its own context past
+    the size gate by reporting 1 token. Label says which number won.
 
     Heuristic intentionally over-estimates non-ASCII content: one token per non-ASCII
     char vs. real tokenizers' ~1 token per CJK char. A too-strict gate wastes one
     retry; a too-loose gate wastes real money.
     """
+    ascii_chars = sum(1 for c in text if ord(c) < 128)
+    non_ascii = len(text) - ascii_chars
+    heuristic = (ascii_chars // 4) + non_ascii
     if tokenizer is not None:
         try:
             count = tokenizer(text)
-            if isinstance(count, int) and count > 0:
-                return count, "adapter"
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                if count >= heuristic:
+                    return count, "adapter"
         except Exception:
             pass
-    ascii_chars = sum(1 for c in text if ord(c) < 128)
-    non_ascii = len(text) - ascii_chars
-    return (ascii_chars // 4) + non_ascii, "heuristic"
+    return heuristic, "heuristic"
 
 
 def summarize_evidence(ledger_entries: Any) -> str:
@@ -83,6 +88,8 @@ class ContextSpec:
     acceptance_descriptions: list[str]
     max_input_tokens: int = DEFAULT_MAX_TOKENS
     spec_hash: str = ""
+    tools: list[str] = field(default_factory=list)   # the task's grant is part of
+    risk: str = "reversible"                           # the seal: no silent widening
 
     def compute_hash(self) -> str:
         body = json.dumps({
@@ -91,6 +98,8 @@ class ContextSpec:
             "globs": sorted(self.file_globs),
             "acceptance": sorted(self.acceptance_descriptions),
             "max_tokens": self.max_input_tokens,
+            "tools": sorted(self.tools),
+            "risk": self.risk,
         }, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(body.encode()).hexdigest()
 
@@ -143,6 +152,8 @@ class ContextCompiler:
             file_globs=list(task.paths),
             acceptance_descriptions=[c.description for c in task.acceptance],
             max_input_tokens=max_input_tokens,
+            tools=list(task.tools),
+            risk=getattr(task.risk, "value", str(task.risk)),
         )
         spec.lock()
         return spec

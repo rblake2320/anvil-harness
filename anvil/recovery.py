@@ -50,6 +50,21 @@ class Compensation:
     undo: Callable[[], None]  # the compensating action
     note: str = ""
     done: bool = False
+    task_id: str = ""         # owning task; lets recovery unwind one task's effects
+
+
+@dataclass
+class CompensationReport:
+    done: list[str] = field(default_factory=list)            # side effects undone
+    failed: dict[str, str] = field(default_factory=dict)     # idem key -> error
+
+
+class CompensationError(RuntimeError):
+    """One or more compensations raised. All were still attempted."""
+
+    def __init__(self, report: CompensationReport):
+        super().__init__(f"compensation failed: {report.failed}")
+        self.report = report
 
 
 class RecoveryManager:
@@ -77,16 +92,37 @@ class RecoveryManager:
         self.compensations.append(comp)
         return True
 
-    def compensate_all(self) -> list[str]:
-        """Run un-done compensations in reverse order. Returns labels compensated."""
-        done = []
+    def compensate(self, task_id: Optional[str] = None) -> CompensationReport:
+        """Run un-done compensations in reverse order, behind a fault barrier.
+
+        task_id: only unwind that task's side effects (None = every task).
+        A compensation that raises is recorded in `failed` and left un-done so an
+        operator can retry it; the remaining compensations still run. One broken
+        undo must never strand every other side effect.
+        """
+        report = CompensationReport()
         for comp in reversed(self.compensations):
-            if comp.done:
+            if comp.done or (task_id is not None and comp.task_id != task_id):
                 continue
-            comp.undo()
+            try:
+                comp.undo()
+            except Exception as e:  # noqa: BLE001 - fault barrier
+                report.failed[comp.idempotency_key] = f"{type(e).__name__}: {e}"
+                continue
             comp.done = True
-            done.append(comp.side_effect)
-        return done
+            report.done.append(comp.side_effect)
+        return report
+
+    def compensate_all(self) -> list[str]:
+        """Unwind every task's side effects. Returns labels compensated.
+
+        Every compensation is attempted; if any raised, CompensationError is
+        raised afterwards carrying the full report.
+        """
+        report = self.compensate()
+        if report.failed:
+            raise CompensationError(report)
+        return report.done
 
     # ---- repair ladder ------------------------------------------------
     def next_action(self, strikes: int) -> RepairAction:

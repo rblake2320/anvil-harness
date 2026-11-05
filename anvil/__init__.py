@@ -3,12 +3,15 @@ from .schemas import (
     AcceptanceCheck, AmbiguityClass, EventType, Phase, PolicyDecision,
     Risk, Task, TaskStatus, ToolCall, Evidence,
 )
-from .ledger import Ledger, LedgerEntry
+from .ledger import Ledger, LedgerCorruptError, LedgerEntry
 from .budget import Budget, CircuitBreaker
 from .context import ContextSpec, ContextBundle, ContextCompiler, summarize_evidence, DEFAULT_MAX_TOKENS
 from .policy import PolicyEngine, ToolPolicy
 from .proofgate import ProofGate, acceptance_hash
-from .recovery import RecoveryManager, Compensation, Checkpoint, RepairAction
+from .recovery import (
+    RecoveryManager, Compensation, CompensationError, CompensationReport, Checkpoint,
+    RepairAction,
+)
 from .store import MissionStore, Contract
 from .lifecycle import Lifecycle, StepResult
 from .adapters import (
@@ -20,13 +23,14 @@ from .log import (
     _redact,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "AcceptanceCheck", "AmbiguityClass", "EventType", "Phase", "PolicyDecision",
     "Risk", "Task", "TaskStatus", "ToolCall", "Evidence",
-    "Ledger", "LedgerEntry", "Budget", "CircuitBreaker", "PolicyEngine", "ToolPolicy",
+    "Ledger", "LedgerCorruptError", "LedgerEntry", "Budget", "CircuitBreaker", "PolicyEngine", "ToolPolicy",
     "ContextSpec", "ContextBundle", "ContextCompiler", "summarize_evidence", "DEFAULT_MAX_TOKENS",
-    "ProofGate", "acceptance_hash", "RecoveryManager", "Compensation", "Checkpoint",
+    "ProofGate", "acceptance_hash", "RecoveryManager", "Compensation", "CompensationError",
+    "CompensationReport", "Checkpoint",
     "RepairAction", "MissionStore", "Contract", "Lifecycle", "StepResult",
     "AgentAdapter", "VerifierAdapter", "CommandVerifier", "SimulatedAgent", "SimulatedVerifier",
     "LogChannel", "LogLevel", "LogRouter", "LogEntry", "TraceContext", "SpanEntry",

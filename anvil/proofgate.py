@@ -21,6 +21,7 @@ Evidence. The harness owns the verdict; the verifier only supplies proof.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -79,9 +80,33 @@ class ProofGate:
             return GateResult(False, "no acceptance criteria; cannot prove completion", [])
 
         # A. run every check via the independent verifier
-        results = [verifier.run_check(task, c) for c in task.acceptance]
+        results = [self._run_one(task, c, verifier) for c in task.acceptance]
         failed = [e for e in results if not e.ok]
         if failed:
             return GateResult(False, f"{len(failed)} check(s) failed: "
                               f"{[e.check_id for e in failed]}", results)
         return GateResult(True, "all acceptance checks passed", results)
+
+    @staticmethod
+    def _run_one(task: Task, check: AcceptanceCheck, verifier: Verifier) -> Evidence:
+        """Fault barrier around one verifier call.
+
+        The verifier receives a deep copy so it cannot mutate harness-owned state.
+        An exception, a non-Evidence return, evidence for a different task/check,
+        or a non-True `ok` all count as a FAILED check: no proof = not done.
+        """
+        try:
+            ev = verifier.run_check(copy.deepcopy(task), copy.deepcopy(check))
+        except Exception as e:  # noqa: BLE001 - any verifier fault is a failed proof
+            return Evidence(task.id, check.id, ok=False,
+                            detail=f"verifier error: {type(e).__name__}: {e}")
+        if not isinstance(ev, Evidence):
+            return Evidence(task.id, check.id, ok=False,
+                            detail=f"verifier returned {type(ev).__name__}, not Evidence")
+        if ev.task_id != task.id or ev.check_id != check.id:
+            return Evidence(task.id, check.id, ok=False,
+                            detail=f"verifier evidence mislabeled "
+                                   f"({ev.task_id}/{ev.check_id} != {task.id}/{check.id})")
+        if ev.ok is not True:
+            ev = Evidence(task.id, check.id, ok=False, detail=ev.detail, artifact=ev.artifact)
+        return ev

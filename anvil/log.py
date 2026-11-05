@@ -29,7 +29,8 @@ Rolling hash per channel:
 
   where json_line_n is the exact JSON string written to disk (no trailing newline).
   This makes the channel verifiable entry-by-entry and detects insertion, deletion,
-  reorder, and payload mutation.
+  reorder, and payload mutation. Chains are cumulative across resumed runs on the
+  same store: a new ChannelWriter replays the existing file before appending.
 """
 from __future__ import annotations
 
@@ -150,8 +151,19 @@ _SECRET_RE = re.compile(
 
 _REDACTED = "[REDACTED]"
 
+# Payload keys under which the HARNESS itself writes SHA-256 digests (acceptance
+# locks, context bundle hashes, evidence entry hashes). A 64-hex digest trips the
+# long-base64 rule, which would strip every provenance hash from the channels.
+# Exempt only when BOTH hold: the key is harness-owned AND the value is exactly a
+# 64-char lowercase hex digest. A hex secret under any other key is still scrubbed.
+_DIGEST_KEYS: frozenset[str] = frozenset({
+    "request_hash", "bundle_hash", "locks", "context_spec_locks",
+    "locked", "live", "evidence", "hash",
+})
+_HEX64_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
-def _redact(obj: Any) -> Any:
+
+def _redact(obj: Any, _digest_ctx: bool = False) -> Any:
     """Recursively scrub sensitive key names and secret-looking string values."""
     if isinstance(obj, dict):
         out: dict[str, Any] = {}
@@ -159,12 +171,16 @@ def _redact(obj: Any) -> Any:
             if isinstance(k, str) and k.lower() in _REDACT_KEYS:
                 out[k] = _REDACTED
             else:
-                out[k] = _redact(v)
+                ctx = _digest_ctx or (isinstance(k, str) and k in _DIGEST_KEYS)
+                out[k] = _redact(v, ctx)
         return out
     if isinstance(obj, list):
-        return [_redact(x) for x in obj]
-    if isinstance(obj, str) and _SECRET_RE.search(obj):
-        return _REDACTED
+        return [_redact(x, _digest_ctx) for x in obj]
+    if isinstance(obj, str):
+        if _digest_ctx and _HEX64_RE.fullmatch(obj):
+            return obj
+        if _SECRET_RE.search(obj):
+            return _REDACTED
     return obj
 
 
@@ -239,8 +255,10 @@ class ChannelWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.touch()
-        self._hash = ZERO_CHANNEL_HASH
-        self._count = 0
+        # Resume: continue the chain over whatever an earlier run already wrote.
+        # Starting from genesis here would make every resumed run's anchor
+        # disagree with the file and verify-logs would cry TAMPERED.
+        self._hash, self._count = compute_channel_hash(self.path)
 
     @property
     def tail_hash(self) -> str:

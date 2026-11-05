@@ -15,6 +15,7 @@ lifecycle moves to HALTED for operator attention. Fail closed, not open.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -42,6 +43,17 @@ class CircuitBreaker:
 
     def charge(self, steps: int = 1, cost: float = 0.0,
                input_tokens: int = 0, output_tokens: int = 0) -> None:
+        """Add usage. Rejects negative / NaN / infinite / non-numeric amounts.
+
+        A negative charge would refund budget; a NaN makes every `>` comparison
+        False, disabling the ceiling forever. Both fail closed with ValueError.
+        """
+        for name, v in (("steps", steps), ("cost", cost),
+                        ("input_tokens", input_tokens), ("output_tokens", output_tokens)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{name} must be a number, got {type(v).__name__}")
+            if not math.isfinite(v) or v < 0:
+                raise ValueError(f"{name} must be finite and >= 0, got {v!r}")
         self.steps += steps
         self.cost += cost
         self.input_tokens += input_tokens

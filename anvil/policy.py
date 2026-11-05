@@ -22,7 +22,7 @@ at the PTY layer it governs an adversarial one.
 from __future__ import annotations
 
 import fnmatch
-import os
+import posixpath
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -49,22 +49,43 @@ class PolicyEngine:
         # Default False: development credentials only, prod is unreachable.
         self.elevated = elevated
 
-    def classify_risk(self, call: ToolCall) -> Risk:
-        if call.risk == Risk.IRREVERSIBLE or call.tool in self.policy.irreversible_tools:
+    def classify_risk(self, call: ToolCall, task: Optional[Task] = None) -> Risk:
+        """Risk is the MAX of what the contract, the policy, and the call say.
+
+        `call.risk` is agent-supplied, so it can only raise risk, never lower it.
+        A task the contract declared IRREVERSIBLE makes every call in it
+        irreversible: the agent cannot route a side effect through a tool name
+        the policy table happens not to list.
+        """
+        if (call.risk == Risk.IRREVERSIBLE
+                or call.tool in self.policy.irreversible_tools
+                or (task is not None and task.risk == Risk.IRREVERSIBLE)):
             return Risk.IRREVERSIBLE
         return Risk.REVERSIBLE
+
+    @staticmethod
+    def normalize_path(p: str) -> Optional[str]:
+        """Canonical POSIX form, or None if the path escapes its root.
+
+        Backslashes are converted BEFORE normalizing: otherwise on POSIX
+        `src\\..\\..\\etc` survives normpath untouched and only becomes a
+        traversal after the separator swap, sailing past an `src/*` match.
+        """
+        if not isinstance(p, str) or not p or "\x00" in p:
+            return None
+        norm = posixpath.normpath(p.replace("\\", "/"))
+        if norm == ".." or norm.startswith("../"):
+            return None
+        return norm
 
     def _in_scope(self, target: str, allowed: list[str]) -> bool:
         if not allowed:
             # No declared paths => the task is not permitted to touch the filesystem.
             return False
-        # Normalize to collapse .. traversals before matching.
-        # os.path.normpath("src/../secret.txt") -> "secret.txt" which won't match "src/*".
-        # Paths that still start with ".." after normalization have escaped the tree root.
-        norm = os.path.normpath(target).replace("\\", "/")
-        if norm.startswith(".."):
+        norm = self.normalize_path(target)
+        if norm is None:
             return False
-        return any(fnmatch.fnmatch(norm, pat) for pat in allowed)
+        return any(fnmatch.fnmatchcase(norm, pat.replace("\\", "/")) for pat in allowed)
 
     def decide(self, call: ToolCall, task: Task) -> PolicyDecision:
         # 1. allowlist — empty tools list means NO tools are permitted (fail-closed).
@@ -85,7 +106,7 @@ class PolicyEngine:
                 return PolicyDecision(False, f"path '{p}' outside task scope {task.paths}")
 
         # 3. risk gate
-        if self.classify_risk(call) == Risk.IRREVERSIBLE:
+        if self.classify_risk(call, task) == Risk.IRREVERSIBLE:
             return PolicyDecision(
                 False,
                 f"irreversible action '{call.tool}' requires commit-point approval",
