@@ -4,27 +4,41 @@ ANVIL mission store: the execution CONTRACT as on-disk artifacts.
 The long vibecoding prompt is treated as source code. COMPILE emits a contract;
 the loop executes the contract, never the raw prompt. Layout (`.mission/`):
 
-  ORIGINAL_REQUEST.md   immutable, hashed at intake; never edited
+  ORIGINAL_REQUEST.md   immutable, hashed at intake; never edited (chmod 0444)
   MISSION.md            distilled goal
   SCOPE.md              in/out of scope + change-control rule
-  PLAN.graph.json       task DAG + locked acceptance hashes (the seal)
-  CONTEXT_BUDGET.yaml   always-load vs JIT-retrieve rules (curation, anti context-rot)
-  TOOL_POLICY.yaml      allowlists + privileged tools + elevation
+  PLAN.graph.json       task DAG + locked acceptance AND context-spec hashes (the
+                        seals) + context_budget (e.g. max_tokens_per_task)
   STATE.json            phase + per-task status (machine-owned, not in the model)
   ASSUMPTIONS.md        recorded safe-default decisions (ambiguity policy)
   MEMORY.md             durable cross-session memory (read at session start)
-  WORKSTATE.md          volatile current-session scratch
-  LEDGER.jsonl          hash-chained truth (see ledger.py)
+  LEDGER.jsonl          hash-chained truth (see ledger.py) + LEDGER.jsonl.lock
+  logs/<channel>.jsonl  digest-anchored specialist log channels (see log.py)
+
+Tool policy is code (policy.ToolPolicy), not an on-disk artifact. Machine-owned
+JSON (PLAN, STATE) is written atomically: temp file + fsync + os.replace, so a
+crash leaves the previous complete version, never a truncated one.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 from .schemas import Phase, Task, TaskStatus
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Crash-safe replace: readers see the old file or the new one, never half."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -62,21 +76,34 @@ class MissionStore:
 
     # ---- intake: freeze the request, immutable + hashed ----
     def freeze_request(self, text: str) -> str:
+        """Freeze the request bytes exactly (binary I/O: no CRLF translation on
+        Windows, so the hash is identical on every OS).
+
+        Re-freezing with the SAME text is an idempotent resume. Re-freezing with
+        DIFFERENT text raises: silently returning the old hash would let a caller
+        believe a new request was frozen when the mission is bound to the old one.
+        """
+        data = text.encode("utf-8")
+        h = hashlib.sha256(data).hexdigest()
         if self.request_path.exists():
-            existing = self.request_path.read_text(encoding="utf-8")
-            return hashlib.sha256(existing.encode()).hexdigest()
-        self.request_path.write_text(text, encoding="utf-8")
+            existing = self.request_hash()
+            if existing != h:
+                raise ValueError(
+                    f"ORIGINAL_REQUEST.md is already frozen (sha256={existing[:12]}...) with "
+                    f"different content; a changed request needs a new mission directory")
+            return existing
+        _atomic_write(self.request_path, data)
         # make it read-only on disk as a belt-and-suspenders signal
         try:
             self.request_path.chmod(0o444)
         except OSError:
             pass
-        return hashlib.sha256(text.encode()).hexdigest()
+        return h
 
     def request_hash(self) -> Optional[str]:
         if not self.request_path.exists():
             return None
-        return hashlib.sha256(self.request_path.read_text(encoding="utf-8").encode()).hexdigest()
+        return hashlib.sha256(self.request_path.read_bytes()).hexdigest()
 
     # ---- contract persistence ----
     def save_contract(self, c: Contract) -> None:
@@ -97,7 +124,7 @@ class MissionStore:
             "context_spec_locks": c.context_spec_locks,
             "tasks": [t.to_dict() for t in c.tasks],
         }
-        self.plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+        _atomic_write(self.plan_path, json.dumps(plan, indent=2).encode("utf-8"))
 
     def load_contract(self) -> Contract:
         plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
@@ -113,11 +140,11 @@ class MissionStore:
 
     # ---- state (machine-owned, not the model's memory) ----
     def save_state(self, phase: Phase, tasks: list[Task]) -> None:
-        self.state_path.write_text(json.dumps({
+        _atomic_write(self.state_path, json.dumps({
             "phase": phase.value,
             "tasks": {t.id: t.status.value for t in tasks},
             "strikes": {t.id: t.strikes for t in tasks},
-        }, indent=2), encoding="utf-8")
+        }, indent=2).encode("utf-8"))
 
     def load_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -132,33 +159,27 @@ class MissionStore:
     def read_memory(self) -> str:
         return self.memory_path.read_text(encoding="utf-8") if self.memory_path.exists() else ""
 
-    def recover_trace_id(self) -> Optional[str]:
+    def recover_trace_id(self, signing_key: Optional[bytes] = None) -> Optional[str]:
         """Read the ledger and return the trace_id from the first intake_frozen event.
 
         Use this to link a resumed Lifecycle to its original trace segment:
             lc = Lifecycle(store, agent, verifier,
                            trace_id=store.recover_trace_id())
         Returns None if no intake_frozen event exists or the ledger has been tampered.
-        Verifies ledger integrity before trusting any content.
+        Verifies ledger integrity before trusting any content. Pass the run's
+        signing_key for an HMAC-signed ledger (keyless verify of a signed ledger
+        always fails, so this would return None).
         """
         if not self.ledger_path.exists():
             return None
         from .ledger import Ledger
-        led = Ledger(self.ledger_path)
+        led = Ledger(self.ledger_path, signing_key=signing_key)
         ok, _ = led.verify()
         if not ok:
             return None  # tampered ledger — do not trust any payload
-        with self.ledger_path.open("r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("type") == "intake_frozen":
-                    return rec.get("payload", {}).get("trace_id")
+        for e in led:
+            if e.type == "intake_frozen":
+                return e.payload.get("trace_id")
         return None
 
     # ---- ambiguity / assumption log ----

@@ -23,9 +23,23 @@ PHASES
 
 Every transition and decision is appended to the hash-chained ledger AND fanned
 out to specialist log channels via the LogRouter.
+
+ENFORCEMENT NOTES
+  * Phase order is mechanical: each phase method raises RuntimeError if called
+    out of order, so no caller can execute a plan that never passed review.
+  * Adapters (agent, verifier, approval_fn) only ever receive deep copies of a
+    Task. Policy decisions use the harness's sealed copy, so an agent mutating
+    its view (adding tools/paths, dropping checks) gains nothing; the harness
+    also diffs the view afterwards and treats any mutation as tampering.
+  * Every adapter call sits behind a fault barrier: an exception or malformed
+    return is a strike, never a crashed controller with a task stuck RUNNING.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -36,15 +50,43 @@ from .context import ContextCompiler, summarize_evidence, DEFAULT_MAX_TOKENS
 from .ledger import Ledger, LedgerEntry
 from .log import EVENT_LEVELS, LogChannel, LogLevel, LogRouter, TraceContext
 from .policy import PolicyEngine, ToolPolicy
-from .proofgate import ProofGate
-from .recovery import Compensation, RecoveryManager, RepairAction
+from .proofgate import ProofGate, acceptance_hash
+from .recovery import Checkpoint, Compensation, RecoveryManager, RepairAction
 from .schemas import (
     AmbiguityClass, EventType, Phase, PolicyDecision, Risk, Task, TaskStatus, ToolCall,
 )
 from .store import Contract, MissionStore
 
 # An approval callback returns True to grant a commit-point, False to deny.
+# Only the literal `True` grants; any other value (truthy or not) or an
+# exception is a denial. Fail safe.
 ApprovalFn = Callable[[Task, ToolCall], bool]
+# Restores code state to a checkpoint (e.g. `git reset --hard <ref>`).
+RollbackFn = Callable[[Checkpoint], None]
+
+
+def _usage(result: dict) -> tuple[int, int, float]:
+    """Validate adapter-reported usage. Raises ValueError on anything that could
+    refund or disable the budget (negative, NaN, inf, bool, non-numeric)."""
+    vals = []
+    for key, kind in (("input_tokens", int), ("output_tokens", int), ("cost", float)):
+        v = result.get(key, 0)
+        if v is None:
+            v = 0
+        ok_type = isinstance(v, int) if kind is int else isinstance(v, (int, float))
+        if isinstance(v, bool) or not ok_type:
+            raise ValueError(f"{key}={v!r} is not a valid {kind.__name__}")
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(f"{key}={v!r} must be finite and >= 0")
+        vals.append(v)
+    return int(vals[0]), int(vals[1]), float(vals[2])
+
+
+def _call_digest(call: ToolCall) -> str:
+    """Stable identity of a side effect: same tool + args + paths = same effect."""
+    body = json.dumps({"tool": call.tool, "args": call.args, "paths": call.paths},
+                      sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -67,6 +109,7 @@ class Lifecycle:
         signing_key: Optional[bytes] = None,
         code_author: str = "executor",
         trace_id: Optional[str] = None,
+        rollback_fn: Optional[RollbackFn] = None,
     ):
         self.store = store
         self.agent = agent
@@ -81,6 +124,9 @@ class Lifecycle:
         self.trace = TraceContext(trace_id=trace_id)
         # default approval: deny everything (fail safe). Wire a real HITL fn in.
         self.approval_fn = approval_fn or (lambda t, c: False)
+        # Without a rollback_fn, ROLLED_BACK is recorded with executed=False: the
+        # ledger says what SHOULD be restored; nothing claims it was.
+        self.rollback_fn = rollback_fn
         self.phase = Phase.INTAKE
         self.contract: Optional[Contract] = None
         self._anchored = False
@@ -133,8 +179,9 @@ class Lifecycle:
     def _log(self, etype: EventType, **payload) -> LedgerEntry:
         entry = self.ledger.append(etype.value, payload)
         level = EVENT_LEVELS.get(etype.value, LogLevel.INFO.value)
+        # Fan out the ledger's normalized payload (JSON-safe), not the raw kwargs.
         self.log_router.route(
-            etype.value, payload,
+            etype.value, entry.payload,
             level=level,
             trace_id=self.trace.trace_id,
             span_id=self.trace.current_span_id,
@@ -158,9 +205,45 @@ class Lifecycle:
             return StepResult(Phase.HALTED, reason or "circuit open", halted=True)
         return None
 
+    def _require_phase(self, method: str, *allowed: Phase) -> None:
+        """Mechanical phase ordering. Out-of-order calls are programming errors
+        that would skip a gate (e.g. execute without review), so they raise."""
+        if self.phase not in allowed:
+            raise RuntimeError(
+                f"{method}() not permitted in phase '{self.phase.value}' "
+                f"(requires {', '.join(p.value for p in allowed)})")
+
+    # ---- adapter isolation ----
+
+    @staticmethod
+    def _view(task: Task) -> Task:
+        """What adapters get: a deep copy. Mutating it cannot touch the grant."""
+        return copy.deepcopy(task)
+
+    def _view_tampered(self, task: Task, view: Task, where: str) -> bool:
+        """Diff an adapter's view against the sealed task. Logs + strikes on drift.
+
+        Mutation is an attempted gate bypass (widen tools/paths, drop a hard
+        check). It is a security event, and deterministic: the same agent will
+        do it again, so escalate on strike 1 instead of burning retries.
+        """
+        if acceptance_hash(view.acceptance) != acceptance_hash(task.acceptance):
+            self._log(EventType.ACCEPTANCE_TAMPERED, task=task.id,
+                      reason=f"agent mutated acceptance criteria during {where} (tamper)")
+            self._strike(task, f"acceptance tamper during {where}", deterministic=True)
+            return True
+        grant = lambda t: (t.id, t.risk, sorted(t.tools), sorted(t.paths), sorted(t.deps))
+        if grant(view) != grant(task):
+            self._log(EventType.CONTEXT_TAMPERED, task=task.id,
+                      reason=f"agent mutated its grant (id/risk/tools/paths/deps) during {where}")
+            self._strike(task, f"grant tamper during {where}", deterministic=True)
+            return True
+        return False
+
     # ================= phases =================
 
     def intake(self, request_text: str) -> StepResult:
+        self._require_phase("intake", Phase.INTAKE)
         h = self.store.freeze_request(request_text)
         # Log trace_id in the ledger so resumed runs can recover it for continuity.
         self._log(EventType.INTAKE_FROZEN, request_hash=h, trace_id=self.trace.trace_id)
@@ -172,6 +255,7 @@ class Lifecycle:
         return StepResult(self.phase, f"request frozen sha256={h[:12]}")
 
     def baseline(self, snapshot: dict) -> StepResult:
+        self._require_phase("baseline", Phase.BASELINE)
         self._log(EventType.BASELINE_CAPTURED, snapshot=snapshot)
         ref = snapshot.get("ref", "baseline")
         self.recovery.checkpoint("baseline", ref)
@@ -180,6 +264,7 @@ class Lifecycle:
         return StepResult(self.phase, "baseline captured")
 
     def compile(self, contract: Contract) -> StepResult:
+        self._require_phase("compile", Phase.COMPILE)
         # LOCK acceptance hashes (defeats test-gaming) and context spec hashes
         # (defeats task-mutation between compile and execute).
         max_tokens = contract.context_budget.get("max_tokens_per_task", DEFAULT_MAX_TOKENS)
@@ -199,12 +284,26 @@ class Lifecycle:
 
     @staticmethod
     def _task_path_in_scope(task_path: str, scope_in: list[str]) -> bool:
-        """True if task_path is contained within the contract's scope_in."""
-        prefix = task_path.split("*")[0].rstrip("/")
+        """True if task_path is contained within the contract's scope_in.
+
+        The literal (non-glob) prefix is normalized and must not contain any
+        '..' component: `src/../etc/*` textually starts with `src/` but names
+        a directory outside it.
+        """
+        raw = task_path.replace("\\", "/")
+        if any(seg == ".." for seg in raw.split("/")):
+            return False
+        cut = min((i for i, ch in enumerate(raw) if ch in "*?["), default=len(raw))
+        prefix = raw[:cut].rstrip("/")
         if not prefix:
             return False  # bare wildcard (*) can escape any bounded scope
+        prefix = PolicyEngine.normalize_path(prefix)
+        if prefix is None:
+            return False
         for s in scope_in:
-            scope_root = s.rstrip("/*")
+            scope_root = s.replace("\\", "/").rstrip("/*")
+            if not scope_root:
+                continue
             if prefix == scope_root or prefix.startswith(scope_root + "/"):
                 return True
         return False
@@ -233,6 +332,7 @@ class Lifecycle:
 
     def review(self) -> StepResult:
         """Gate the plan itself before any work begins."""
+        self._require_phase("review", Phase.REVIEW)
         assert self.contract
         problems: list[str] = []
 
@@ -258,6 +358,14 @@ class Lifecycle:
                         f"{t.id}: high-risk task has executor-authored checks {self_authored}; "
                         f"require independent (QA) authorship"
                     )
+            # A reversible task granted an irreversible tool would dodge the
+            # QA-authorship rule above. The contract must declare the real risk.
+            irrev = sorted(set(t.tools) & self.policy.policy.irreversible_tools)
+            if irrev and t.risk != Risk.IRREVERSIBLE:
+                problems.append(
+                    f"{t.id}: grants irreversible tool(s) {irrev} but is declared "
+                    f"reversible; declare risk=IRREVERSIBLE"
+                )
             for dep in t.deps:
                 if dep not in seen_ids:
                     problems.append(f"{t.id}: unknown dependency '{dep}'")
@@ -274,6 +382,68 @@ class Lifecycle:
         self._log(EventType.REVIEW_PASSED, tasks=len(self.contract.tasks))
         self._set_phase(Phase.EXECUTE, note="plan approved")
         return StepResult(self.phase, "plan approved")
+
+    # ---- resume (process death / operator restart) ----
+
+    def resume(self) -> StepResult:
+        """Continue a mission from disk. The LEDGER is the trust anchor, not the
+        unsigned PLAN.graph.json / STATE.json files:
+
+          * ledger must verify (pass the same signing_key to Lifecycle);
+          * the on-disk contract must reproduce the acceptance + context-spec
+            seals committed in the ledger's CONTRACT_COMPILED event (an edited
+            plan that widens a grant is refused);
+          * the plan must have passed review (REVIEW_PASSED after compile);
+          * task completion is taken from TASK_DONE ledger events; everything
+            else restarts PENDING with zero strikes (operator reset);
+          * checkpoints are restored from the ledger. Saga compensations hold
+            live callables and cannot be restored; the ledger records them.
+        Pass `trace_id=store.recover_trace_id(signing_key)` to Lifecycle to keep
+        one correlated trace.
+        """
+        self._require_phase("resume", Phase.INTAKE)
+        ok, reason = self.ledger.verify()
+        if not ok:
+            raise RuntimeError(f"cannot resume: ledger failed verification: {reason}")
+        entries = self.ledger.entries()
+        compiled = [e for e in entries if e.type == EventType.CONTRACT_COMPILED.value]
+        if not compiled:
+            raise RuntimeError("cannot resume: no compiled contract in the ledger")
+        seal = compiled[-1]
+        if not any(e.type == EventType.REVIEW_PASSED.value and e.seq > seal.seq
+                   for e in entries):
+            raise RuntimeError("cannot resume: sealed contract never passed review")
+        phases = [e.payload.get("phase") for e in entries
+                  if e.type == EventType.PHASE_CHANGED.value]
+        if phases and phases[-1] == Phase.DONE.value:
+            raise RuntimeError("cannot resume: mission already DONE")
+
+        contract = self.store.load_contract()
+        max_tokens = contract.context_budget.get("max_tokens_per_task", DEFAULT_MAX_TOKENS)
+        if [t.id for t in contract.tasks] != seal.payload.get("tasks"):
+            raise RuntimeError("cannot resume: on-disk task list differs from sealed contract")
+        for t in contract.tasks:
+            if (self.gate.lock(t) != seal.payload["locks"].get(t.id)
+                    or self._context_compiler.build_spec(t, max_tokens).spec_hash
+                    != seal.payload["context_spec_locks"].get(t.id)):
+                raise RuntimeError(
+                    f"cannot resume: task '{t.id}' on disk differs from the sealed contract")
+        contract.acceptance_locks = dict(seal.payload["locks"])
+        contract.context_spec_locks = dict(seal.payload["context_spec_locks"])
+
+        done = {e.payload.get("task") for e in entries if e.type == EventType.TASK_DONE.value}
+        for t in contract.tasks:
+            t.status = TaskStatus.DONE if t.id in done else TaskStatus.PENDING
+            t.strikes = 0
+        for e in entries:
+            if e.type == EventType.CHECKPOINT_MADE.value and "label" in e.payload:
+                self.recovery.checkpoint(e.payload["label"], e.payload.get("ref", ""))
+
+        self.contract = contract
+        remaining = [t.id for t in contract.tasks if t.status != TaskStatus.DONE]
+        target = Phase.EXECUTE if remaining else Phase.LEARN
+        self._set_phase(target, note=f"resumed; remaining={remaining}")
+        return StepResult(self.phase, f"resumed {len(done)} done, {len(remaining)} remaining")
 
     # ---- DAG readiness ----
 
@@ -300,6 +470,9 @@ class Lifecycle:
     def run_task(self, task: Task) -> bool:
         """Span-tracking wrapper: opens a trace span, delegates to _do_task,
         then records timing to PERF and TRACE channels."""
+        if self.phase == Phase.HALTED:
+            return False
+        self._require_phase("run_task", Phase.EXECUTE)
         if self._guard_budget():
             return False
 
@@ -365,11 +538,21 @@ class Lifecycle:
                       estimated_tokens=bundle.estimated_tokens,
                       estimator=bundle.estimator)
 
-        # 1) AGENT DECISION: log what the executor proposes before gating
-        if bundle is not None and hasattr(self.agent, "plan_calls_with_context"):
-            calls = self.agent.plan_calls_with_context(task, bundle)
-        else:
-            calls = self.agent.plan_calls(task)
+        # 1) AGENT DECISION: the agent plans against a COPY of the task (fault
+        #    barrier + tamper diff), then we log what it proposes before gating.
+        view = self._view(task)
+        try:
+            if bundle is not None and hasattr(self.agent, "plan_calls_with_context"):
+                calls = self.agent.plan_calls_with_context(view, bundle)
+            else:
+                calls = self.agent.plan_calls(view)
+        except Exception as e:  # noqa: BLE001 - adapter fault barrier
+            return self._strike(task, f"plan_calls raised {type(e).__name__}: {e}")
+        if self._view_tampered(task, view, "plan_calls"):
+            return False
+        if (not isinstance(calls, (list, tuple))
+                or not all(isinstance(c, ToolCall) for c in calls)):
+            return self._strike(task, "agent returned a malformed plan (expected list[ToolCall])")
         if calls:
             self.log_router.write(
                 LogChannel.AGENT, "agent_decision",
@@ -379,7 +562,7 @@ class Lifecycle:
                 trace_id=self.trace.trace_id, span_id=span_id,
             )
 
-        # 2) EXECUTE: harness gates each proposed call
+        # 2) EXECUTE: harness gates each proposed call against ITS sealed task
         for call in calls:
             if self._guard_budget():
                 return False
@@ -392,42 +575,53 @@ class Lifecycle:
                 return self._strike(task, f"denied: {decision.reason}")
 
             if decision.requires_approval:
-                # commit-point: irreversible work pauses for recorded human approval
+                # commit-point: irreversible work pauses for recorded human approval.
+                # Only a literal True grants; exceptions and other values deny.
                 task.status = TaskStatus.AWAITING_APPROVAL
                 self._log(EventType.APPROVAL_REQUESTED, task=task.id, tool=call.tool,
                           args=call.args)
-                granted = self.approval_fn(task, call)
+                try:
+                    granted = self.approval_fn(self._view(task), copy.deepcopy(call)) is True
+                    why = "denied by approver"
+                except Exception as e:  # noqa: BLE001 - fail-safe deny
+                    granted, why = False, f"approval_fn raised {type(e).__name__}: {e}"
                 if not granted:
-                    self._log(EventType.APPROVAL_DENIED, task=task.id, tool=call.tool)
+                    self._log(EventType.APPROVAL_DENIED, task=task.id, tool=call.tool,
+                              reason=why)
                     return self._strike(task, "approval denied")
                 self._log(EventType.APPROVAL_GRANTED, task=task.id, tool=call.tool)
 
             self._log(EventType.TOOL_CALL_ALLOWED, task=task.id, tool=call.tool)
 
             # DEPENDENCY: time the actual execution and log latency
+            view = self._view(task)
             dep_start = time.monotonic()
-            result = self.agent.perform(task, call)
+            try:
+                result = self.agent.perform(view, call)
+                perform_error = None
+            except Exception as e:  # noqa: BLE001 - adapter fault barrier
+                result, perform_error = {"ok": False}, f"{type(e).__name__}: {e}"
             dep_ms = (time.monotonic() - dep_start) * 1000.0
+            if not isinstance(result, dict):
+                perform_error = f"perform returned {type(result).__name__}, not dict"
+                result = {"ok": False}
+            ok = bool(result.get("ok", True)) and perform_error is None
             self.log_router.write(
                 LogChannel.DEPENDENCY, "dependency_result",
-                {"task": task.id, "tool": call.tool,
-                 "ok": result.get("ok"), "duration_ms": dep_ms},
+                {"task": task.id, "tool": call.tool, "ok": ok, "duration_ms": dep_ms,
+                 **({"error": perform_error} if perform_error else {})},
                 trace_id=self.trace.trace_id, span_id=span_id,
             )
-
-            # If the adapter explicitly signals failure, strike immediately.
-            # _strike() logs TASK_FAILED — don't log it here too.
-            if not result.get("ok", True):
-                return self._strike(task, "adapter returned ok=False")
-
-            # TOKEN: if the adapter returns usage, charge + log it, then re-check budget.
-            # Budget is also checked per-step in _guard_budget; this catches a single
-            # tool call that blows past a token ceiling mid-task.
-            inp = result.get("input_tokens", 0)
-            out = result.get("output_tokens", 0)
-            call_cost = result.get("cost", 0.0)
+            # TOKEN: charge usage BEFORE judging ok -- a failed call still burned
+            # real tokens/money, and retries must not run uncharged. Usage is
+            # validated: negative/NaN/inf would refund or disable the breaker.
+            try:
+                inp, out, call_cost = _usage(result)
+            except ValueError as e:
+                return self._strike(task, f"invalid usage report: {e}")
             if inp or out or call_cost:
-                self.breaker.charge(input_tokens=inp, output_tokens=out, cost=call_cost)
+                self.breaker.charge(steps=0, input_tokens=inp, output_tokens=out,
+                                    cost=call_cost)
                 self._log(EventType.TOKEN_CHARGED, task=task.id, tool=call.tool,
                           input_tokens=inp, output_tokens=out, cost=call_cost,
                           cumulative_cost=self.breaker.cost,
@@ -440,16 +634,30 @@ class Lifecycle:
                     self._set_phase(Phase.HALTED, note=reason_b or "token budget exceeded")
                     return False
 
-            # SAGA: if an irreversible side effect succeeded, register compensation NOW
-            if self.policy.classify_risk(call) == Risk.IRREVERSIBLE and result.get("ok"):
-                idem = result.get("idempotency_key", f"{task.id}:{call.tool}")
+            # If the adapter signals failure (or raised), strike.
+            # _strike() logs TASK_FAILED -- don't log it here too.
+            if not ok:
+                return self._strike(
+                    task, f"perform failed: {perform_error}" if perform_error
+                    else "adapter returned ok=False")
+
+            # SAGA: an irreversible side effect succeeded -> register compensation NOW.
+            # Default idempotency key covers tool+args+paths so two distinct side
+            # effects in one task never collide (and an exact replay still dedupes).
+            if self.policy.classify_risk(call, task) == Risk.IRREVERSIBLE:
+                idem = result.get("idempotency_key") or f"{task.id}:{call.tool}:{_call_digest(call)}"
                 undo = result.get("undo")
                 if callable(undo):
-                    comp = Compensation(side_effect=f"{call.tool}", idempotency_key=idem,
-                                        undo=undo, note=task.id)
+                    comp = Compensation(side_effect=f"{call.tool}", idempotency_key=str(idem),
+                                        undo=undo, note=task.id, task_id=task.id)
                     if self.recovery.register_compensation(comp):
                         self._log(EventType.CHECKPOINT_MADE, kind="compensation",
-                                  side_effect=call.tool, idem=idem)
+                                  side_effect=call.tool, idem=str(idem))
+
+            # Tamper check AFTER saga registration: if the agent mutated its view
+            # while also completing a side effect, escalation must still unwind it.
+            if self._view_tampered(task, view, "perform"):
+                return False
 
         # 3) VERIFY: independent proof gate against the LOCKED acceptance
         task.status = TaskStatus.AWAITING_PROOF
@@ -489,13 +697,24 @@ class Lifecycle:
                   reason=reason, next_action=action.value, deterministic=deterministic)
         if self.recovery.exhausted(task.strikes) or action == RepairAction.ESCALATE:
             task.status = TaskStatus.BLOCKED
-            # roll back code state + compensate any external effects from this task
+            # roll back code state + compensate THIS task's external effects. Other
+            # tasks' effects were verified DONE; unwinding them would leave STATE
+            # claiming DONE for work that no longer exists. Operators can unwind
+            # the whole mission explicitly via recovery.compensate().
             cp = self.recovery.last_checkpoint()
             if cp:
-                self._log(EventType.ROLLED_BACK, to=cp.ref, task=task.id)
-            compensated = self.recovery.compensate_all()
-            if compensated:
-                self._log(EventType.COMPENSATED, effects=compensated)
+                executed, err = False, None
+                if self.rollback_fn is not None:
+                    try:
+                        self.rollback_fn(cp)
+                        executed = True
+                    except Exception as e:  # noqa: BLE001 - fault barrier
+                        err = f"{type(e).__name__}: {e}"
+                self._log(EventType.ROLLED_BACK, to=cp.ref, task=task.id,
+                          executed=executed, **({"error": err} if err else {}))
+            report = self.recovery.compensate(task_id=task.id)
+            if report.done or report.failed:
+                self._log(EventType.COMPENSATED, effects=report.done, failed=report.failed)
             self._set_phase(Phase.HALTED, note=f"{task.id} escalated to operator")
         else:
             task.status = TaskStatus.READY  # eligible for retry (same or swapped model)
@@ -503,6 +722,8 @@ class Lifecycle:
 
     def execute_all(self) -> StepResult:
         """Drive the DAG until done, blocked, or halted."""
+        if self.phase != Phase.HALTED:
+            self._require_phase("execute_all", Phase.EXECUTE)
         assert self.contract
         guard = 0
         while True:
@@ -531,7 +752,13 @@ class Lifecycle:
         return StepResult(self.phase, "all tasks done")
 
     def learn(self, lessons: list[str]) -> StepResult:
-        """Final audit vs ORIGINAL_REQUEST + durable memory write."""
+        """Final audit vs ORIGINAL_REQUEST + durable memory write.
+
+        Only reachable from LEARN (all tasks verified DONE). A HALTED run must
+        not be relabeled DONE; record lessons from a failed run with
+        store.append_memory() instead.
+        """
+        self._require_phase("learn", Phase.LEARN)
         ok, reason = self.ledger.verify()
         self._log(EventType.MEMORY_WRITTEN, action="audit", ledger_ok=ok, reason=reason)
         for line in lessons:

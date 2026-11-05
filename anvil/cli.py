@@ -7,6 +7,9 @@ ANVIL CLI.
   anvil ledger      <dir>  print the ledger event stream
   anvil verify-logs <dir>  check channel digests against their ledger anchors
 
+Signed ledgers: pass --key-env NAME, where env var NAME holds the HMAC key as hex.
+Truncation check: `audit --expect-head HASH` with a head hash recorded off-box.
+
 The demo proves the machine end to end with simulated seats.  For real runs,
 implement AgentAdapter/VerifierAdapter against Claude Code + a test runner and
 call the Lifecycle phases the same way demo() does.
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -61,7 +65,8 @@ def _demo(root: str) -> int:
     print("-> learn");    print("  ", lc.learn(["demo run complete"]).note)
     ok, reason = lc.audit()
     print(f"\nledger verified: {ok}" + (f" ({reason})" if reason else ""))
-    print(f"events: {len(store and lc.ledger.entries())}   artifacts: {store.dir}")
+    print(f"events: {len(lc.ledger.entries())}   head: {lc.ledger.last().hash}")
+    print(f"artifacts: {store.dir}")
     return 0 if ok else 1
 
 
@@ -76,23 +81,31 @@ def _status(root: str) -> int:
     return 0
 
 
-def _audit(root: str) -> int:
+def _audit(root: str, key: bytes | None = None, expect_head: str | None = None) -> int:
     from .ledger import Ledger
-    led = Ledger(MissionStore(root).ledger_path)
-    ok, reason = led.verify()
-    print(f"ledger: {'OK' if ok else 'TAMPERED'}  entries={len(led.entries())}"
+    led = Ledger(MissionStore(root).ledger_path, signing_key=key)
+    ok, reason = led.verify(expected_head=expect_head)
+    try:
+        n = len(led.entries())
+    except Exception:  # noqa: BLE001 - corrupt file; reason already says why
+        n = "?"
+    print(f"ledger: {'OK' if ok else 'TAMPERED'}  entries={n}"
           + (f"  reason={reason}" if reason else ""))
     return 0 if ok else 1
 
 
-def _ledger(root: str) -> int:
-    from .ledger import Ledger
-    for e in Ledger(MissionStore(root).ledger_path):
-        print(f"{e.seq:4d} {e.type:24s} {json.dumps(e.payload)[:120]}")
+def _ledger(root: str, key: bytes | None = None) -> int:
+    from .ledger import Ledger, LedgerCorruptError
+    try:
+        for e in Ledger(MissionStore(root).ledger_path, signing_key=key):
+            print(f"{e.seq:4d} {e.type:24s} {json.dumps(e.payload)[:120]}")
+    except LedgerCorruptError as err:
+        print(f"LEDGER CORRUPT: {err}")
+        return 1
     return 0
 
 
-def _verify_logs(root: str) -> int:
+def _verify_logs(root: str, key: bytes | None = None) -> int:
     """Re-derive each channel's rolling hash and compare against ledger anchors.
 
     The ledger is verified first (tampered ledger = can't trust anchors).
@@ -104,7 +117,7 @@ def _verify_logs(root: str) -> int:
     from .log import compute_channel_hash
 
     store = MissionStore(root)
-    led = Ledger(store.ledger_path)
+    led = Ledger(store.ledger_path, signing_key=key)
 
     ok, reason = led.verify()
     if not ok:
@@ -115,6 +128,14 @@ def _verify_logs(root: str) -> int:
     if not digest_events:
         print("No channel_digest anchors in ledger (run completes via learn() to anchor).")
         return 0
+
+    # Unanchored trailing entries only matter after the LATEST anchor of each
+    # channel; entries after an earlier anchor are covered by a later one
+    # (resumed runs extend the same cumulative chain).
+    latest: dict[str, int] = {}
+    for event in digest_events:
+        for ch_name in event.payload.get("channels", {}):
+            latest[ch_name] = event.seq
 
     any_fail = False
     for event in digest_events:
@@ -132,7 +153,7 @@ def _verify_logs(root: str) -> int:
             elif actual_hash != expected_hash:
                 print(f"  TAMPERED   {ch_name}: hash mismatch ({expected_count} entries)")
                 any_fail = True
-            elif total_count > expected_count:
+            elif total_count > expected_count and latest[ch_name] == event.seq:
                 extra = total_count - expected_count
                 print(f"  APPENDED   {ch_name}: {extra} unanchored entries after anchor point")
                 any_fail = True
@@ -141,16 +162,37 @@ def _verify_logs(root: str) -> int:
     return 1 if any_fail else 0
 
 
+def _key_from_env(name: str | None) -> bytes | None:
+    if not name:
+        return None
+    raw = os.environ.get(name)
+    if not raw:
+        raise SystemExit(f"error: env var {name} is not set or empty")
+    try:
+        return bytes.fromhex(raw.strip())
+    except ValueError:
+        raise SystemExit(f"error: env var {name} must hold the signing key as hex")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="anvil", description="Governed agent execution harness")
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("demo", "status", "audit", "ledger", "verify-logs"):
         sp = sub.add_parser(name)
         sp.add_argument("dir", nargs="?", default=".")
+        if name in ("audit", "ledger", "verify-logs"):
+            sp.add_argument("--key-env", metavar="NAME",
+                            help="env var holding the ledger HMAC key (hex)")
+        if name == "audit":
+            sp.add_argument("--expect-head", metavar="HASH",
+                            help="head hash recorded off-box; must be in the chain")
     args = p.parse_args(argv)
-    fn = {"demo": _demo, "status": _status, "audit": _audit,
-          "ledger": _ledger, "verify-logs": _verify_logs}
-    return fn[args.cmd](args.dir)
+    key = _key_from_env(getattr(args, "key_env", None))
+    if args.cmd == "audit":
+        return _audit(args.dir, key, args.expect_head)
+    if args.cmd in ("ledger", "verify-logs"):
+        return {"ledger": _ledger, "verify-logs": _verify_logs}[args.cmd](args.dir, key)
+    return {"demo": _demo, "status": _status}[args.cmd](args.dir)
 
 
 if __name__ == "__main__":

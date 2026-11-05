@@ -16,7 +16,7 @@ python -m anvil.cli status /tmp/run      # phase + per-task state
 python -m anvil.cli audit  /tmp/run      # verify the tamper-evident ledger
 python -m anvil.cli ledger /tmp/run      # print the event stream
 python -m anvil.cli verify-logs /tmp/run # check channel digests against ledger anchors
-pytest -q                                # 98 tests prove the safety invariants
+pytest -q                                # 233 tests prove the safety invariants
 ```
 
 ## The lifecycle (cradle to grave)
@@ -39,8 +39,10 @@ pytest -q                                # 98 tests prove the safety invariants
    breaks verification of all later entries (`test_ledger.py`). Tail truncation (deleting
    the last N entries) is not detected by the chain alone; pair with `verify-logs` whose
    channel-digest anchor in the ledger proves channel state at run close, or use an
-   external head anchor (write the final hash to a separate store). Optional HMAC/PKA
-   signing stops an attacker who can write the file but lacks the key.
+   external head anchor: record `ledger.last().hash` off-box and check it with
+   `anvil audit --expect-head HASH`. Optional HMAC/PKA signing stops an attacker who
+   can write the file but lacks the key (`--key-env` audits signed ledgers). Appends
+   are cross-process locked and fsynced; a torn write fails closed.
 2. **No fake completion** — a task cannot reach `DONE` without an *independent*
    verifier accepting evidence; the executor never grades itself (`test_proofgate.py`).
 3. **No test-gaming** — acceptance criteria are hashed and locked at compile; if the
@@ -55,8 +57,18 @@ pytest -q                                # 98 tests prove the safety invariants
    escalate); code state rolls back via checkpoints; **external** side effects are
    undone via idempotent, reverse-order **compensations** (saga), because you cannot
    "restore a snapshot" to un-send a webhook or un-run a migration (`test_recovery.py`).
-8. **Runaway containment** — step/time/cost circuit breaker trips closed and stays open
-   until an operator resets (`test_budget.py`).
+8. **Runaway containment** — step/time/cost/token circuit breaker trips closed and stays
+   open until an operator resets (`test_budget.py`). NaN, infinite, negative or
+   non-numeric usage is rejected (it would otherwise disable or refund the budget), and
+   failed calls are still charged.
+9. **No gate skipping** — phase order is mechanical (`execute_all()` before `review()`
+   raises); a HALTED run cannot be relabeled DONE; resume re-derives state from the
+   ledger and refuses a plan edited on disk (`test_hardening.py`).
+10. **The model cannot widen its own grant** — adapters only see deep copies of a task;
+    a mutated copy is a tamper event. Agent-supplied signals (`call.risk`, token
+    counts) can only tighten a gate, never loosen it.
+11. **Faults never crash the controller** — every adapter, verifier, approval, undo and
+    rollback call is fault-barriered; a failure becomes a recorded strike or denial.
 
 ## Wiring your real stack
 
@@ -84,6 +96,9 @@ class VerifierAdapter(Protocol):
   an adversarial one. This is the "enforce at the execution surface" layer.
 - **Signed ledger** → pass `signing_key=` to `Lifecycle` to MAC-chain the ledger; drop
   in your PKA signer to match the GUMBO ledger model.
+- **Code rollback** → pass `rollback_fn=` (e.g. `git reset --hard <checkpoint.ref>`);
+  otherwise `ROLLED_BACK` is logged with `executed=False`.
+- **Resume** → `Lifecycle(...).resume()` after a crash; see `agents.md`.
 
 ## What I added beyond the council transcript
 
@@ -104,7 +119,14 @@ those, and added the controls that close the *remaining* gaps:
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `anvil audit` says TAMPERED on a clean run | Ledger was signed; keyless audit can't verify the MAC | Audit with the same `signing_key`, or run unsigned. |
+| `anvil audit` says TAMPERED on a clean run | Ledger was signed; keyless audit can't verify the MAC | `anvil audit DIR --key-env ANVIL_KEY` with the hex key in that env var. |
+| `LedgerCorruptError: torn final ledger entry` | Process died mid-append | Fail-closed by design. Inspect the last line of `LEDGER.jsonl`; after confirming it is a torn write, remove only that partial line, then `anvil audit`. |
+| `TimeoutError: ledger lock busy` | Another process holds `LEDGER.jsonl.lock` > 30 s | Find the stuck writer; the lock is released when its process exits. |
+| `RuntimeError: ... not permitted in phase` | Phase method called out of order | Call `intake -> baseline -> compile -> review -> execute_all -> learn`, or `resume()` on a fresh `Lifecycle`. |
+| `resume()` says plan differs from sealed contract | `PLAN.graph.json` edited after compile | Restore the plan, or start a new mission dir; the ledger seals are authoritative. |
+| `ValueError: ORIGINAL_REQUEST.md is already frozen` | Re-intake with different request text | A changed request is a new mission: use a new directory. |
+| Task escalates with `invalid usage report` | Adapter returned NaN/negative/non-numeric usage | Fix the adapter's usage accounting. |
+| Task escalates with `grant tamper` / `acceptance tamper` | Adapter mutated the Task it was given | Adapters must treat the Task as read-only. |
 | Irreversible task halts immediately | No `approval_fn` wired ⇒ fail-safe deny | Pass a real `approval_fn`. |
 | `deploy` denied even with approval | It's a privileged (prod) tool; session is dev-isolated | Set `PolicyEngine(elevated=True)` only in a session that legitimately holds prod creds. |
 | Task loops then blocks | Strikes exhausted (3) | Inspect ledger `task_failed` reasons; fix the check or the agent. |

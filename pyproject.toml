@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anvil-harness"
-version = "0.1.0"
+version = "0.3.0"
 description = "Governed, proof-gated execution harness for long-horizon AI agent work"
 readme = "README.md"
 requires-python = ">=3.10"
